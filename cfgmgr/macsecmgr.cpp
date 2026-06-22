@@ -266,6 +266,112 @@ static void wpa_cli_exec_and_check(
     }
 }
 
+
+/*
+ * Issue the wpa_supplicant control-interface key-management commands used for
+ * hitless PSK/CAK rollover. The CAK is passed already decoded (plain hex), the
+ * CKN is the hex name. Each wrapper throws std::runtime_error on a non-OK
+ * reply (via wpa_cli_exec_and_check).
+ */
+static void mka_rotate_key(
+    const std::string & sock,
+    const std::string & port_name,
+    const std::string & old_ckn,
+    const std::string & cak,
+    const std::string & ckn)
+{
+    wpa_cli_exec_and_check(
+        sock, port_name, "", "mka_update_key",
+        "old_ckn=" + old_ckn, "cak=" + cak, "ckn=" + ckn);
+}
+
+static void mka_add_key(
+    const std::string & sock,
+    const std::string & port_name,
+    const std::string & cak,
+    const std::string & ckn)
+{
+    wpa_cli_exec_and_check(
+        sock, port_name, "", "mka_add_key", "cak=" + cak, "ckn=" + ckn);
+}
+
+static void mka_del_key(
+    const std::string & sock,
+    const std::string & port_name,
+    const std::string & ckn)
+{
+    wpa_cli_exec_and_check(
+        sock, port_name, "", "mka_del_key", "ckn=" + ckn);
+}
+
+static std::string to_lower_copy(const std::string & s)
+{
+    std::string r(s);
+    std::transform(r.begin(), r.end(), r.begin(), ::tolower);
+    return r;
+}
+
+/*
+ * Parse the per-participant section of a `wpa_cli ... status` reply into a map
+ * of CKN (lowercase hex) -> live peer count. The KaY status emits, for each
+ * MKA participant, a "ckn=<hex>" line followed by a "live_peers=<n>" line.
+ */
+static std::map<std::string, int> parse_mka_participants(
+    const std::string & status)
+{
+    std::map<std::string, int> participants;
+    std::istringstream stream(status);
+    std::string line;
+    std::string ckn;
+
+    while (std::getline(stream, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        if (boost::istarts_with(line, "ckn="))
+        {
+            ckn = to_lower_copy(line.substr(strlen("ckn=")));
+        }
+        else if (boost::istarts_with(line, "live_peers=") && !ckn.empty())
+        {
+            try
+            {
+                participants[ckn] =
+                    std::stoi(line.substr(strlen("live_peers=")));
+            }
+            catch (const std::exception &)
+            {
+                participants[ckn] = 0;
+            }
+            ckn.clear();
+        }
+    }
+
+    return participants;
+}
+
+static bool participant_present(
+    const std::map<std::string, int> & participants,
+    const std::string & ckn)
+{
+    return !ckn.empty() &&
+        participants.find(to_lower_copy(ckn)) != participants.end();
+}
+
+static bool participant_live(
+    const std::map<std::string, int> & participants,
+    const std::string & ckn)
+{
+    if (ckn.empty())
+    {
+        return false;
+    }
+    auto it = participants.find(to_lower_copy(ckn));
+    return it != participants.end() && it->second >= 1;
+}
+
 MACsecMgr::MACsecMgr(
     DBConnector *cfgDb,
     DBConnector *stateDb,
@@ -399,38 +505,220 @@ task_process_status MACsecMgr::loadProfile(
 {
     SWSS_LOG_ENTER();
 
-    auto profile = m_profiles.emplace(
-        std::piecewise_construct,
-        std::make_tuple(profile_name),
-        std::make_tuple());
+    auto existing = m_profiles.find(profile_name);
+    bool existed = (existing != m_profiles.end());
+
+    // Build the candidate profile from the incoming attributes without
+    // committing it, so that a rejected hot update leaves both m_profiles and
+    // the running wpa_supplicant configuration unchanged.
+    MACsecProfile candidate;
     try
     {
-        if (profile.first->second.update(profile_attr))
+        if (!candidate.update(profile_attr))
         {
-            SWSS_LOG_NOTICE(
-                "The MACsec profile '%s' is loaded",
+            SWSS_LOG_WARN(
+                "The MACsec profile '%s' is missing mandatory fields",
                 profile_name.c_str());
+            return task_failed;
         }
-        // If the profile has been used
-        if (profile.second)
-        {
-            for (auto & port : m_macsec_ports)
-            {
-                if (port.second.profile_name == profile_name)
-                {
-                    // Hot update
-                    SWSS_LOG_DEBUG("Hot update");
-                }
-            }
-        }
-        return task_success;
     }
     catch(const std::invalid_argument & e)
     {
         SWSS_LOG_WARN("%s", e.what());
         return task_failed;
     }
+
+    if (!existed)
+    {
+        // Initial load: the profile is not yet bound to any port.
+        m_profiles[profile_name] = candidate;
+        SWSS_LOG_NOTICE(
+            "The MACsec profile '%s' is loaded", profile_name.c_str());
+        return task_success;
+    }
+
+    const MACsecProfile old_profile = existing->second;
+
+    bool primary_changed =
+        old_profile.primary_ckn != candidate.primary_ckn ||
+        old_profile.primary_cak != candidate.primary_cak;
+    bool fallback_changed =
+        old_profile.fallback_ckn != candidate.fallback_ckn ||
+        old_profile.fallback_cak != candidate.fallback_cak;
+
+    // Collect the ports currently using this profile.
+    std::vector<std::string> ports;
+    for (const auto & port : m_macsec_ports)
+    {
+        if (port.second.profile_name == profile_name)
+        {
+            ports.push_back(port.first);
+        }
+    }
+
+    if ((!primary_changed && !fallback_changed) || ports.empty())
+    {
+        // No key change, or the profile is not bound to a port yet: just
+        // record the new attributes. Non-key fields are not hot-applied.
+        existing->second = candidate;
+        SWSS_LOG_NOTICE(
+            "The MACsec profile '%s' is updated", profile_name.c_str());
+        return task_success;
+    }
+
+    if (primary_changed && fallback_changed)
+    {
+        // Rotating both keys in a single operation would leave no stable
+        // session to carry traffic across the second rotation. Require the
+        // operator to rotate one key at a time.
+        SWSS_LOG_ERROR(
+            "MACsec profile '%s' update rejected: primary and fallback keys "
+            "cannot be rotated in the same operation; rotate one at a time",
+            profile_name.c_str());
+        return task_failed;
+    }
+
+    // Apply the single key change to every port using the profile. m_profiles
+    // is only committed once all ports succeed, so a precondition rejection
+    // (task_failed) or a transient failure (task_need_retry) preserves the
+    // diff for a subsequent retry.
+    for (const auto & port_name : ports)
+    {
+        auto status = hotUpdateProfile(
+            port_name, m_macsec_ports.at(port_name),
+            old_profile, candidate, primary_changed, fallback_changed);
+        if (status != task_success)
+        {
+            return status;
+        }
+    }
+
+    existing->second = candidate;
+    SWSS_LOG_NOTICE(
+        "MACsec profile '%s' key rotation applied to %zu port(s)",
+        profile_name.c_str(), ports.size());
+    return task_success;
 }
+
+
+task_process_status MACsecMgr::hotUpdateProfile(
+    const std::string & port_name,
+    const MKASession & session,
+    const MACsecProfile & old_profile,
+    const MACsecProfile & new_profile,
+    bool primary_changed,
+    bool fallback_changed) const
+{
+    SWSS_LOG_ENTER();
+
+    // Snapshot the live MKA participant state so the preconditions can be
+    // evaluated and already-applied rotations skipped (idempotent on retry).
+    std::string status;
+    try
+    {
+        status = wpa_cli_exec(session.sock, port_name, "", "status");
+    }
+    catch(const std::exception & e)
+    {
+        SWSS_LOG_WARN(
+            "MACsec key rotation on '%s': unable to query wpa_supplicant "
+            "status (%s), will retry", port_name.c_str(), e.what());
+        return task_need_retry;
+    }
+
+    auto participants = parse_mka_participants(status);
+
+    try
+    {
+        if (primary_changed)
+        {
+            if (participant_present(participants, new_profile.primary_ckn))
+            {
+                SWSS_LOG_NOTICE(
+                    "MACsec primary key on '%s' already rotated, skipping",
+                    port_name.c_str());
+            }
+            else if (!participant_live(participants, old_profile.fallback_ckn))
+            {
+                SWSS_LOG_ERROR(
+                    "MACsec primary key rotation on '%s' rejected: no "
+                    "established fallback session to carry traffic",
+                    port_name.c_str());
+                return task_failed;
+            }
+            else
+            {
+                mka_rotate_key(
+                    session.sock, port_name, old_profile.primary_ckn,
+                    decodeKey(new_profile.primary_cak, new_profile.cipher_suite),
+                    new_profile.primary_ckn);
+                SWSS_LOG_NOTICE(
+                    "MACsec primary key rotated on '%s'", port_name.c_str());
+            }
+        }
+
+        if (fallback_changed)
+        {
+            bool removing = new_profile.fallback_ckn.empty();
+            bool adding = old_profile.fallback_ckn.empty();
+
+            if (removing)
+            {
+                if (participant_present(participants, old_profile.fallback_ckn))
+                {
+                    mka_del_key(
+                        session.sock, port_name, old_profile.fallback_ckn);
+                    SWSS_LOG_NOTICE(
+                        "MACsec fallback key removed on '%s'",
+                        port_name.c_str());
+                }
+            }
+            else if (participant_present(participants, new_profile.fallback_ckn))
+            {
+                SWSS_LOG_NOTICE(
+                    "MACsec fallback key on '%s' already updated, skipping",
+                    port_name.c_str());
+            }
+            else if (!participant_live(participants, new_profile.primary_ckn))
+            {
+                SWSS_LOG_ERROR(
+                    "MACsec fallback key rotation on '%s' rejected: primary is "
+                    "not the active session", port_name.c_str());
+                return task_failed;
+            }
+            else if (adding)
+            {
+                mka_add_key(
+                    session.sock, port_name,
+                    decodeKey(new_profile.fallback_cak,
+                              new_profile.cipher_suite),
+                    new_profile.fallback_ckn);
+                SWSS_LOG_NOTICE(
+                    "MACsec fallback key added on '%s'", port_name.c_str());
+            }
+            else
+            {
+                mka_rotate_key(
+                    session.sock, port_name, old_profile.fallback_ckn,
+                    decodeKey(new_profile.fallback_cak,
+                              new_profile.cipher_suite),
+                    new_profile.fallback_ckn);
+                SWSS_LOG_NOTICE(
+                    "MACsec fallback key rotated on '%s'", port_name.c_str());
+            }
+        }
+    }
+    catch(const std::runtime_error & e)
+    {
+        SWSS_LOG_WARN(
+            "MACsec key rotation on '%s' failed: %s, will retry",
+            port_name.c_str(), e.what());
+        return task_need_retry;
+    }
+
+    return task_success;
+}
+
 
 task_process_status MACsecMgr::removeProfile(
     const std::string & profile_name,

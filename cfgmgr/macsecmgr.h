@@ -66,6 +66,13 @@ private:
 
     task_process_status removeProfile(const std::string & profile_name, const TaskArgs & profile_attr);
     task_process_status loadProfile(const std::string & profile_name, const TaskArgs & profile_attr);
+    task_process_status hotUpdateProfile(
+        const std::string & port_name,
+        const MKASession & session,
+        const MACsecProfile & old_profile,
+        const MACsecProfile & new_profile,
+        bool primary_changed,
+        bool fallback_changed) const;
     task_process_status enableMACsec(const std::string & port_name, const TaskArgs & port_attr);
     task_process_status disableMACsec(const std::string & port_name, const TaskArgs & port_attr);
 
