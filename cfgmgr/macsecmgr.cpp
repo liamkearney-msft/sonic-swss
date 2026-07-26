@@ -43,6 +43,15 @@ constexpr std::uint64_t CKN_CONVERGE_TIMEOUT_MS = 30000;
 /* Poll interval while waiting for CKN convergence, in milliseconds. */
 constexpr std::uint64_t CKN_CONVERGE_INTERVAL_MS = 500;
 
+/* Settle window after a staged CKN reports a live peer, before the old primary
+ * CA is retired during a hitless rotation, in milliseconds. live_peers >= 1 only
+ * signals MKA peer discovery on the new CA; the key server still has to generate
+ * and distribute a SAK and both ends must install it into the datapath. Deleting
+ * the old CA on the convergence edge retires the old SAK before the new one is
+ * protecting traffic, which drops frames. Waiting a short window lets the new SAK
+ * install on both ends so the swap stays hitless. */
+constexpr std::uint64_t CKN_ROTATE_SETTLE_MS = 3000;
+
 /*
  * The input cipher_str is the encoded string which can be either of length 66 bytes or 130 bytes.
  *
@@ -366,7 +375,16 @@ bool MACsecMgr::MACsecProfile::update(const TaskArgs & ta)
 {
     SWSS_LOG_ENTER();
 
-    // The following fields are optional
+    // The following fields are optional. Reset them first so that a CONFIG_DB
+    // entry which no longer carries them (e.g. an operator HDEL of
+    // fallback_cak/fallback_ckn) clears any previously applied fallback rather
+    // than retaining stale key material. loadProfile() updates the stored
+    // profile object in place (map::emplace is a no-op for an existing profile),
+    // so without this reset the old fallback CKN/CAK would survive, the hot
+    // update would not observe a fallback change, and its removal would never be
+    // driven onto wpa_supplicant.
+    fallback_cak.clear();
+    fallback_ckn.clear();
     if (GetValue(ta, fallback_cak) && !GetValue(ta, fallback_ckn))
     {
         return false;
@@ -1287,6 +1305,12 @@ bool MACsecMgr::hotUpdateProfile(
         }
         else
         {
+            // The new CA has a live peer, but the key server still needs to
+            // distribute a SAK and both ends must install it into the datapath.
+            // Settle briefly before retiring the old primary so we do not remove
+            // the old SAK while it is still the one protecting traffic.
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(CKN_ROTATE_SETTLE_MS));
             if (!delMKA(sock, port_name, old_profile.primary_ckn))
             {
                 ok = false;
