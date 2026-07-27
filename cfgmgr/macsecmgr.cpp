@@ -43,15 +43,6 @@ constexpr std::uint64_t CKN_CONVERGE_TIMEOUT_MS = 30000;
 /* Poll interval while waiting for CKN convergence, in milliseconds. */
 constexpr std::uint64_t CKN_CONVERGE_INTERVAL_MS = 500;
 
-/* Settle window after a staged CKN reports a live peer, before the old primary
- * CA is retired during a hitless rotation, in milliseconds. live_peers >= 1 only
- * signals MKA peer discovery on the new CA; the key server still has to generate
- * and distribute a SAK and both ends must install it into the datapath. Deleting
- * the old CA on the convergence edge retires the old SAK before the new one is
- * protecting traffic, which drops frames. Waiting a short window lets the new SAK
- * install on both ends so the swap stays hitless. */
-constexpr std::uint64_t CKN_ROTATE_SETTLE_MS = 3000;
-
 /*
  * The input cipher_str is the encoded string which can be either of length 66 bytes or 130 bytes.
  *
@@ -1305,12 +1296,6 @@ bool MACsecMgr::hotUpdateProfile(
         }
         else
         {
-            // The new CA has a live peer, but the key server still needs to
-            // distribute a SAK and both ends must install it into the datapath.
-            // Settle briefly before retiring the old primary so we do not remove
-            // the old SAK while it is still the one protecting traffic.
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(CKN_ROTATE_SETTLE_MS));
             if (!delMKA(sock, port_name, old_profile.primary_ckn))
             {
                 ok = false;
