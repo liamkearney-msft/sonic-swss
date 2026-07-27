@@ -1238,10 +1238,16 @@ bool MACsecMgr::hotUpdateProfile(
     const std::string & sock = session.sock;
     bool ok = true;
 
-    // 1. Primary CKN change -> hitless rotation. Stage the new key as a standby
-    //    CA, wait for it to converge with the peer, then remove the old primary
-    //    so the control plane hands the CP to the survivor. The datapath stays
-    //    up across the principal swap (design §7 "Hitless CAK rotation").
+    // 1. Primary CKN change -> hitless rotation, carried by the fallback CA.
+    //    Hitlessness comes from the fallback key already being established, not
+    //    from making-before-breaking the primary. Remove the old primary so
+    //    wpa_supplicant immediately rides the live fallback CA, then add the new
+    //    primary; once it converges wpa prefers it and swaps back, with the
+    //    fallback protecting traffic throughout. This keeps at most two CAs on
+    //    the port at once (fallback + one primary) and never stages a third.
+    //    A rotation therefore requires a fallback to be established: without one
+    //    there is nothing to carry traffic during the swap, so refuse it (the
+    //    CLI should also reject it at command time).
     //
     //    A same-CKN, CAK-only change cannot be rotated hitlessly: the control
     //    plane keys participants by CKN (a duplicate CKN is rejected by
@@ -1265,40 +1271,70 @@ bool MACsecMgr::hotUpdateProfile(
             old_profile.primary_ckn.c_str(),
             new_profile.primary_ckn.c_str());
 
-        if (!addMKA(
-                sock,
-                port_name,
-                new_profile.primary_ckn,
-                decodeKey(new_profile.primary_cak, new_profile.cipher_suite),
-                true))
+        // The new primary is already an established CA when it is the current
+        // fallback being promoted (primary A->B where B was the fallback). It
+        // is live, so it can take over as principal with no new negotiation.
+        const bool new_primary_already_live =
+            !old_profile.fallback_ckn.empty()
+            && old_profile.fallback_ckn == new_profile.primary_ckn;
+
+        // A rotation is only hitless if a second, already-established CA (the
+        // fallback) is present to carry traffic while the old primary is
+        // retired and the new one negotiates. Refuse to rotate without one
+        // rather than black-holing traffic. This is the daemon-side guard for
+        // direct CONFIG_DB writes; the CLI rejects it at command time too.
+        if (!new_primary_already_live && old_profile.fallback_ckn.empty())
         {
-            SWSS_LOG_WARN(
-                "Cannot stage new primary CKN '%s' on port '%s'; aborting rotation",
-                new_profile.primary_ckn.c_str(),
+            SWSS_LOG_ERROR(
+                "Refusing to rotate primary MACsec CAK on port '%s': no fallback "
+                "CA is established to carry traffic during the rotation. "
+                "Configure a fallback CAK before rotating the primary.",
                 port_name.c_str());
             return false;
         }
 
-        if (!waitForCKNLive(
-                sock,
-                port_name,
-                new_profile.primary_ckn,
-                CKN_CONVERGE_TIMEOUT_MS))
+        // Retire the old primary first. wpa_supplicant carries traffic on the
+        // established fallback CA across the gap (this is the hitless step, and
+        // it drops the port from two CAs to one before we add the new primary).
+        if (!delMKA(sock, port_name, old_profile.primary_ckn))
         {
-            // Do not delete the old CA if the new one has not converged, or we
-            // would force a full re-negotiation and drop traffic.
-            SWSS_LOG_WARN(
-                "New primary CKN '%s' on port '%s' did not converge with a peer "
-                "within timeout; keeping the old primary CA in place",
-                new_profile.primary_ckn.c_str(),
-                port_name.c_str());
             ok = false;
         }
-        else
+
+        // For a fresh primary key, add it as a real primary (not in the fallback
+        // slot) so the port ends with exactly the configured primary + fallback.
+        // A promoted fallback is already live, so there is nothing to add. Wait
+        // for the new primary to converge so the handoff is orderly before any
+        // fallback reconfiguration below; the fallback keeps protecting traffic
+        // during the wait, and at no point are more than two CAs established.
+        if (!new_primary_already_live)
         {
-            if (!delMKA(sock, port_name, old_profile.primary_ckn))
+            if (!addMKA(
+                    sock,
+                    port_name,
+                    new_profile.primary_ckn,
+                    decodeKey(new_profile.primary_cak, new_profile.cipher_suite),
+                    false))
             {
+                SWSS_LOG_ERROR(
+                    "Failed to add new primary CKN '%s' on port '%s' after "
+                    "retiring the old primary; the port is running on the "
+                    "fallback CA only",
+                    new_profile.primary_ckn.c_str(),
+                    port_name.c_str());
                 ok = false;
+            }
+            else if (!waitForCKNLive(
+                        sock,
+                        port_name,
+                        new_profile.primary_ckn,
+                        CKN_CONVERGE_TIMEOUT_MS))
+            {
+                SWSS_LOG_WARN(
+                    "New primary CKN '%s' on port '%s' did not converge with a "
+                    "peer within timeout; the port continues on the fallback CA",
+                    new_profile.primary_ckn.c_str(),
+                    port_name.c_str());
             }
         }
         session.primary_ckn = new_profile.primary_ckn;
