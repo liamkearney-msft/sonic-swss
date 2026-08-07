@@ -58,12 +58,14 @@ public:
         std::string sock;
         // wpa_supplicant process id
         pid_t       wpa_supplicant_pid;
-        // CKNs currently applied to wpa_supplicant for this port. They are
-        // tracked so a profile hot-update can diff the previously applied keys
-        // against the new ones and drive the runtime macsec_* commands
-        // (add/remove/rotate) instead of restarting the MKA session.
+        // Key material currently applied to wpa_supplicant, in the encoded form
+        // held in CONFIG_DB. A hot update diffs against this rather than against
+        // the previous profile, so a partially applied update is retried against
+        // what the port actually has. The fallback pair is empty when the port
+        // has no fallback CA.
+        std::string primary_cak;
         std::string primary_ckn;
-        // Empty when no fallback CA is currently configured on the port.
+        std::string fallback_cak;
         std::string fallback_ckn;
     };
 
@@ -85,12 +87,22 @@ private:
     bool configureMACsec(const std::string & port_name, const MKASession & session, const MACsecProfile & profile) const;
     bool unconfigureMACsec(const std::string & port_name, const MKASession & session) const;
 
-    // Runtime MKA participant management over the per-port wpa_supplicant ctrl
-    // socket. These wrap the macsec_add_mka / macsec_del_mka / macsec_mka_list
-    // commands used to plumb a fallback CA and to perform hitless CAK rotation.
+    // One MKA participant reported by macsec_mka_list.
+    struct MKAParticipant
+    {
+        std::string ckn;
+        bool        fallback = false;
+    };
 
-    // Add an MKA participant. 'fallback' marks it as a standby CA. Idempotent:
-    // an already-present CKN is treated as success.
+    static const MKAParticipant * findParticipant(
+        const std::vector<MKAParticipant> & participants,
+        const std::string & ckn);
+
+    // Runtime MKA participant management over the per-port wpa_supplicant ctrl
+    // socket, wrapping macsec_add_mka / macsec_del_mka / macsec_mka_list.
+
+    // Add an MKA participant. 'fallback' marks it as a standby CA. Idempotent,
+    // and re-adds the CKN when it is present holding the other role.
     bool addMKA(
         const std::string & sock,
         const std::string & port_name,
@@ -102,25 +114,15 @@ private:
         const std::string & sock,
         const std::string & port_name,
         const std::string & ckn) const;
-    // Parse macsec_mka_list into one map of field->value per participant.
-    std::vector<std::map<std::string, std::string>> getMKAParticipants(
+    std::vector<MKAParticipant> getMKAParticipants(
         const std::string & sock,
         const std::string & port_name) const;
-    // Poll macsec_mka_list until the given CKN reports live_peers >= 1, or the
-    // timeout elapses. Returns true once the CKN has converged with a peer.
-    bool waitForCKNLive(
-        const std::string & sock,
-        const std::string & port_name,
-        const std::string & ckn,
-        std::uint64_t timeout_ms) const;
-    // Drive the runtime commands needed to move a live port from old_profile to
-    // new_profile without tearing down the MKA session (primary CAK rotation,
-    // fallback add/remove/change). Updates the CKNs tracked on 'session'.
+    // Apply 'profile' to a live port with runtime commands instead of restarting
+    // the MKA session, recording what was applied on 'session'.
     bool hotUpdateProfile(
         const std::string & port_name,
         MKASession & session,
-        const MACsecProfile & old_profile,
-        const MACsecProfile & new_profile) const;
+        const MACsecProfile & profile) const;
 };
 
 }
