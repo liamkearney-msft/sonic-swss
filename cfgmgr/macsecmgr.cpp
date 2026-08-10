@@ -410,12 +410,16 @@ task_process_status MACsecMgr::loadProfile(
     MACsecProfile new_profile;
     try
     {
-        if (new_profile.update(profile_attr))
+        if (!new_profile.update(profile_attr))
         {
-            SWSS_LOG_NOTICE(
-                "The MACsec profile '%s' is loaded",
+            SWSS_LOG_WARN(
+                "The MACsec profile '%s' is incomplete; rejecting the profile",
                 profile_name.c_str());
+            return task_invalid_entry;
         }
+        SWSS_LOG_NOTICE(
+            "The MACsec profile '%s' is loaded",
+            profile_name.c_str());
 
         // The YANG model rejects this too; guard direct CONFIG_DB writes that bypass it.
         if (!new_profile.fallback_ckn.empty()
@@ -426,6 +430,15 @@ task_process_status MACsecMgr::loadProfile(
                 "primary CKN; rejecting the profile",
                 profile_name.c_str());
             return task_failed;
+        }
+
+        // decodeKey() is the only check on the CAK length and reports a bad key
+        // by throwing. Run it here so a malformed key is rejected before the
+        // profile is committed or any live MKA session is touched below.
+        decodeKey(new_profile.primary_cak, new_profile.cipher_suite);
+        if (!new_profile.fallback_ckn.empty())
+        {
+            decodeKey(new_profile.fallback_cak, new_profile.cipher_suite);
         }
 
         m_profiles[profile_name] = new_profile;
@@ -454,8 +467,8 @@ task_process_status MACsecMgr::loadProfile(
         }
         return status;
     }
-    // decodeKey() is the only check on CAK length and reports a bad key by
-    // throwing, so this also covers the hot update above.
+    // The CAKs are validated above before anything is committed, so this only
+    // backstops the decodeKey() calls made while applying the profile.
     catch(const std::invalid_argument & e)
     {
         SWSS_LOG_WARN("%s", e.what());
