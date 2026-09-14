@@ -31,6 +31,13 @@ namespace macsecmgr_ut
     static std::vector<std::string> g_commands;
     // Commands matching this substring fail, to exercise the error paths.
     static std::string g_failing_command;
+    // When set, macsec_mka_list replies with this verbatim instead of a
+    // rendered snapshot, so a test can hand the parser a specific response.
+    static std::string g_mka_list_override;
+    // Whether the rendered snapshot carries the producer's completion marker.
+    static bool g_snapshot_complete = true;
+    // Live peer count reported for every rendered participant.
+    static unsigned int g_live_peers = 1;
 
     static const pid_t FAKE_WPA_SUPPLICANT_PID = 4242;
 
@@ -111,8 +118,10 @@ namespace macsecmgr_ut
     }
 
     // Render the reply of MACSEC_MKA_LIST exactly as ieee802_1x_kay_get_status
-    // does: KaY level fields, then one block per participant. Note that the
-    // booleans are reported capitalised.
+    // does: KaY level fields, then one block per participant, then the marker
+    // that says the reply was not truncated. Note that the booleans are
+    // reported capitalised, and sci_txt() renders an SCI as MAC@port with the
+    // port in decimal.
     static std::string renderMKAList()
     {
         std::string out =
@@ -126,8 +135,8 @@ namespace macsecmgr_ut
             "Number of Keys Distributed=0\n"
             "Number of Keys Received=0\n"
             "MKA Hello Time=2000\n"
-            "actor_sci=525400123456#0001\n"
-            "key_server_sci=525400abcdef#0001\n";
+            "actor_sci=52:54:00:12:34:56@1\n"
+            "key_server_sci=52:54:00:ab:cd:ef@1\n";
         int idx = 0;
         for (const auto & p : g_participants)
         {
@@ -140,12 +149,16 @@ namespace macsecmgr_ut
             out += "active=Yes\n";
             out += "participant=Yes\n";
             out += "retain=No\n";
-            out += "is_principal=Yes\n";
+            out += std::string("is_principal=") + (p.fallback ? "No" : "Yes") + "\n";
             out += std::string("is_primary=") + (p.fallback ? "No" : "Yes") + "\n";
-            out += "live_peers=1\n";
+            out += "live_peers=" + std::to_string(g_live_peers) + "\n";
             out += "potential_peers=0\n";
             out += "is_key_server=Yes\n";
             out += "is_elected=Yes\n";
+        }
+        if (g_snapshot_complete)
+        {
+            out += "snapshot_complete=1\n";
         }
         return out;
     }
@@ -169,7 +182,9 @@ namespace macsecmgr_ut
 
         if (cmd.find("macsec_mka_list") != std::string::npos)
         {
-            stdout_content = renderMKAList();
+            stdout_content = g_mka_list_override.empty()
+                ? renderMKAList()
+                : g_mka_list_override;
             return 0;
         }
 
@@ -335,6 +350,9 @@ namespace macsecmgr_ut
             g_participants.clear();
             g_commands.clear();
             g_failing_command.clear();
+            g_mka_list_override.clear();
+            g_snapshot_complete = true;
+            g_live_peers = 1;
             callback = fakeWpaCli;
         }
 
@@ -409,7 +427,100 @@ namespace macsecmgr_ut
             macsecmgr.addExistingData(&profile_table);
             macsecmgr.doTask();
         }
+
+        // Orch::doTask() only drains consumers, so the periodic collector has to
+        // be driven through its executor.
+        void firePollTimer(swss::MACsecMgr & macsecmgr)
+        {
+            for (auto * selectable : macsecmgr.getSelectables())
+            {
+                auto * executor = dynamic_cast<Executor *>(selectable);
+                if (executor != nullptr && executor->getName() == "MACSEC_MKA_POLL")
+                {
+                    executor->execute();
+                    return;
+                }
+            }
+            FAIL() << "The MACsec MKA poll timer is not registered";
+        }
+
+        std::string sessionField(
+            const std::string & port_name,
+            const std::string & field)
+        {
+            swss::Table table(m_state_db.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+            std::string value;
+            table.hget(port_name, field, value);
+            return value;
+        }
+
+        bool hasSessionField(const std::string & port_name, const std::string & field)
+        {
+            swss::Table table(m_state_db.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+            std::string value;
+            return table.hget(port_name, field, value);
+        }
+
+        std::string participantField(
+            const std::string & port_name,
+            const std::string & ckn,
+            const std::string & field)
+        {
+            swss::Table table(
+                m_state_db.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
+            std::string value;
+            table.hget(port_name + "|" + ckn, field, value);
+            return value;
+        }
+
+        std::vector<std::string> participantKeys()
+        {
+            swss::Table table(
+                m_state_db.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
+            std::vector<std::string> keys;
+            table.getKeys(keys);
+            return keys;
+        }
     };
+
+    // The fields the parser has to see before it will accept a snapshot, so a
+    // test can build a valid reply and then take exactly one thing away.
+    static std::string mkaSessionHeader()
+    {
+        return
+            "PAE KaY status=Active\n"
+            "Authenticated=Yes\n"
+            "Secured=No\n"
+            "Failed=No\n"
+            "Actor Priority=16\n"
+            "Key Server Priority=16\n"
+            "Is Key Server=Yes\n"
+            "Number of Keys Distributed=3\n"
+            "Number of Keys Received=4\n"
+            "MKA Hello Time=2000\n"
+            "actor_sci=52:54:00:12:34:56@1\n"
+            "key_server_sci=00:00:00:00:00:00@0\n";
+    }
+
+    static std::string mkaParticipantBlock(
+        const std::string & ckn,
+        const std::string & role_field = "is_primary=Yes")
+    {
+        return
+            "participant_idx=0\n"
+            "ckn=" + ckn + "\n"
+            "mi=0a1b2c3d4e5f60718293a4b5\n"
+            "mn=7\n"
+            "active=Yes\n"
+            "participant=Yes\n"
+            "retain=No\n"
+            "is_principal=Yes\n"
+            + role_field + "\n"
+            "live_peers=2\n"
+            "potential_peers=1\n"
+            "is_key_server=No\n"
+            "is_elected=No\n";
+    }
 
     // Enabling MACsec on a port with a fallback configured must add the
     // fallback CA over the control socket, since only the primary is carried by
@@ -986,5 +1097,465 @@ namespace macsecmgr_ut
 
         ASSERT_EQ(countCommands("macsec_del_mka"), 1);
         EXPECT_EQ(g_participants.size(), 1);
+    }
+
+    // --- macsec_mka_list parsing -------------------------------------------
+
+    using MKAStatus = swss::MACsecMgr::MKAStatus;
+
+    TEST(MACsecMkaParser, parsesACompleteSnapshot)
+    {
+        MKAStatus status;
+        std::string error;
+        ASSERT_TRUE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("aabb") + "snapshot_complete=1\n",
+            status,
+            error)) << error;
+
+        EXPECT_EQ(status.kay_status, "active");
+        EXPECT_TRUE(status.authenticated);
+        EXPECT_FALSE(status.secured);
+        EXPECT_FALSE(status.failed);
+        EXPECT_EQ(status.actor_priority, 16u);
+        EXPECT_EQ(status.key_server_priority, 16u);
+        EXPECT_TRUE(status.is_key_server);
+        EXPECT_EQ(status.keys_distributed, 3u);
+        EXPECT_EQ(status.keys_received, 4u);
+        EXPECT_EQ(status.mka_hello_time_ms, 2000u);
+
+        ASSERT_EQ(status.participants.size(), 1u);
+        const auto & participant = status.participants.front();
+        EXPECT_EQ(participant.ckn, "aabb");
+        EXPECT_EQ(participant.participant_index, 0u);
+        EXPECT_EQ(participant.mn, 7u);
+        EXPECT_TRUE(participant.active);
+        EXPECT_TRUE(participant.participant);
+        EXPECT_FALSE(participant.retain);
+        EXPECT_TRUE(participant.is_principal);
+        EXPECT_EQ(participant.live_peers, 2u);
+        EXPECT_EQ(participant.potential_peers, 1u);
+        EXPECT_FALSE(participant.is_key_server);
+        EXPECT_FALSE(participant.is_elected);
+    }
+
+    // sci_txt() renders MAC@port with the port in decimal; STATE_DB carries the
+    // 16 hex digit wire form. An unelected key server has an all zero SCI, which
+    // is a real value rather than a parse failure.
+    TEST(MACsecMkaParser, normalizesSci)
+    {
+        MKAStatus status;
+        std::string error;
+        ASSERT_TRUE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + "snapshot_complete=1\n", status, error)) << error;
+
+        EXPECT_EQ(status.actor_sci, "5254001234560001");
+        EXPECT_EQ(status.key_server_sci, "0000000000000000");
+    }
+
+    TEST(MACsecMkaParser, rejectsAMalformedSci)
+    {
+        MKAStatus status;
+        std::string error;
+        std::string output = mkaSessionHeader() + "snapshot_complete=1\n";
+        output.replace(
+            output.find("52:54:00:12:34:56@1"),
+            sizeof("52:54:00:12:34:56@1") - 1,
+            "525400123456#0001");
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(output, status, error));
+    }
+
+    // The CKN keys the participant row, so it is normalised to one spelling.
+    TEST(MACsecMkaParser, normalizesCknCase)
+    {
+        MKAStatus status;
+        std::string error;
+        ASSERT_TRUE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("AABBCCDD")
+                + "snapshot_complete=1\n",
+            status,
+            error)) << error;
+
+        ASSERT_EQ(status.participants.size(), 1u);
+        EXPECT_EQ(status.participants.front().ckn, "aabbccdd");
+    }
+
+    // is_primary is what wpa_supplicant reports today. It means the inverse of
+    // the is_fallback the schema publishes.
+    TEST(MACsecMkaParser, acceptsIsPrimaryAsTheInverseOfIsFallback)
+    {
+        MKAStatus status;
+        std::string error;
+        ASSERT_TRUE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("aabb", "is_primary=No")
+                + "snapshot_complete=1\n",
+            status,
+            error)) << error;
+        ASSERT_EQ(status.participants.size(), 1u);
+        EXPECT_TRUE(status.participants.front().is_fallback);
+
+        ASSERT_TRUE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("aabb", "is_fallback=Yes")
+                + "snapshot_complete=1\n",
+            status,
+            error)) << error;
+        ASSERT_EQ(status.participants.size(), 1u);
+        EXPECT_TRUE(status.participants.front().is_fallback);
+    }
+
+    TEST(MACsecMkaParser, rejectsConflictingRoleFields)
+    {
+        MKAStatus status;
+        std::string error;
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader()
+                + mkaParticipantBlock("aabb", "is_primary=Yes\nis_fallback=Yes")
+                + "snapshot_complete=1\n",
+            status,
+            error));
+
+        ASSERT_TRUE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader()
+                + mkaParticipantBlock("aabb", "is_primary=Yes\nis_fallback=No")
+                + "snapshot_complete=1\n",
+            status,
+            error)) << error;
+    }
+
+    TEST(MACsecMkaParser, rejectsASnapshotWithoutTheCompletionMarker)
+    {
+        MKAStatus status;
+        std::string error;
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("aabb"), status, error));
+    }
+
+    // Truncation in the middle of a block is obvious. Truncation at a block
+    // boundary is not: without the marker it reads as a participant that has
+    // gone away, which would delete a live row.
+    TEST(MACsecMkaParser, rejectsTruncationAtACleanParticipantBoundary)
+    {
+        MKAStatus status;
+        std::string error;
+        const std::string complete =
+            mkaSessionHeader() + mkaParticipantBlock("aabb") + "snapshot_complete=1\n";
+
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            complete.substr(0, complete.find("snapshot_complete")), status, error));
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + "participant_idx=0\nckn=aabb\n", status, error));
+    }
+
+    TEST(MACsecMkaParser, rejectsAnIncompleteSnapshot)
+    {
+        MKAStatus status;
+        std::string error;
+        std::string output = mkaSessionHeader() + "snapshot_complete=1\n";
+        const std::string dropped = "Secured=No\n";
+        output.erase(output.find(dropped), dropped.size());
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(output, status, error));
+
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + "participant_idx=0\nckn=aabb\nsnapshot_complete=1\n",
+            status,
+            error));
+    }
+
+    TEST(MACsecMkaParser, rejectsDuplicatesAndMultiplePrincipals)
+    {
+        MKAStatus status;
+        std::string error;
+
+        // The same field twice, so a concatenation of two replies cannot pass.
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + "Secured=No\nsnapshot_complete=1\n", status, error));
+
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("aabb")
+                + mkaParticipantBlock("AABB") + "snapshot_complete=1\n",
+            status,
+            error));
+
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("aabb")
+                + mkaParticipantBlock("ccdd") + "snapshot_complete=1\n",
+            status,
+            error));
+    }
+
+    TEST(MACsecMkaParser, rejectsMalformedValues)
+    {
+        MKAStatus status;
+        std::string error;
+
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + "snapshot_complete=0\n", status, error));
+
+        std::string output = mkaSessionHeader() + "snapshot_complete=1\n";
+        output.replace(output.find("Authenticated=Yes"), sizeof("Authenticated=Yes") - 1,
+            "Authenticated=Maybe");
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(output, status, error));
+
+        // An odd length or non hex CKN is not a participant key.
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("aab") + "snapshot_complete=1\n",
+            status,
+            error));
+        EXPECT_FALSE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + mkaParticipantBlock("zzzz") + "snapshot_complete=1\n",
+            status,
+            error));
+    }
+
+    // A wpa_supplicant reporting more than this build knows about is not a
+    // reason to drop the whole snapshot.
+    TEST(MACsecMkaParser, ignoresUnknownFields)
+    {
+        MKAStatus status;
+        std::string error;
+        EXPECT_TRUE(swss::MACsecMgr::parseMKAStatus(
+            mkaSessionHeader() + "Some Future Field=7\n"
+                + mkaParticipantBlock("aabb") + "future_participant_field=7\n"
+                + "snapshot_complete=1\n",
+            status,
+            error)) << error;
+    }
+
+    // --- MKA operational state publication ---------------------------------
+
+    TEST_F(MACsecMgrTest, enablePublishesTheMkaSessionAndParticipants)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+
+        EXPECT_EQ(sessionField(PORT_NAME, "profile"), PROFILE_NAME);
+        EXPECT_EQ(sessionField(PORT_NAME, "query_status"), "ok");
+        EXPECT_EQ(sessionField(PORT_NAME, "kay_status"), "active");
+        // Yes/No is normalised the way the rest of STATE_DB spells a boolean.
+        EXPECT_EQ(sessionField(PORT_NAME, "authenticated"), "true");
+        EXPECT_EQ(sessionField(PORT_NAME, "failed"), "false");
+        EXPECT_EQ(sessionField(PORT_NAME, "actor_sci"), "5254001234560001");
+        EXPECT_EQ(sessionField(PORT_NAME, "mka_hello_time_ms"), "2000");
+        EXPECT_FALSE(sessionField(PORT_NAME, "last_updated").empty());
+
+        EXPECT_EQ(participantKeys().size(), 2u);
+        EXPECT_EQ(participantField(PORT_NAME, CKN_PRIMARY_A, "is_fallback"), "false");
+        EXPECT_EQ(participantField(PORT_NAME, CKN_FALLBACK_A, "is_fallback"), "true");
+        EXPECT_EQ(participantField(PORT_NAME, CKN_PRIMARY_A, "live_peers"), "1");
+        EXPECT_EQ(participantField(PORT_NAME, CKN_PRIMARY_A, "mi"),
+            "0a1b2c3d4e5f60718293a4b5");
+    }
+
+    // A validated snapshot is the whole participant list, so what it omits is
+    // deleted. That only happens once the snapshot has passed validation.
+    TEST_F(MACsecMgrTest, staleParticipantRowsGoOnlyAfterAGoodSnapshot)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+        ASSERT_EQ(participantKeys().size(), 2u);
+
+        // The fallback goes away, but the reply describing that is truncated.
+        g_participants.erase(findFakeParticipantItr(CKN_FALLBACK_A));
+        g_snapshot_complete = false;
+        firePollTimer(macsecmgr);
+
+        EXPECT_EQ(participantKeys().size(), 2u);
+        EXPECT_EQ(sessionField(PORT_NAME, "query_status"), "error");
+
+        g_snapshot_complete = true;
+        // A port whose query failed backs off one tick before it is retried.
+        firePollTimer(macsecmgr);
+        firePollTimer(macsecmgr);
+
+        EXPECT_EQ(participantKeys().size(), 1u);
+        EXPECT_EQ(sessionField(PORT_NAME, "query_status"), "ok");
+    }
+
+    // A wedged wpa_supplicant must not be retried every tick: the port backs off
+    // so the tick budget goes to the ports that are still answering.
+    TEST_F(MACsecMgrTest, aFailingPortBacksOff)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+
+        g_failing_command = "macsec_mka_list";
+        firePollTimer(macsecmgr);
+        ASSERT_EQ(countCommands("macsec_mka_list"), 1u);
+
+        // Skipped, because the previous tick failed.
+        firePollTimer(macsecmgr);
+        EXPECT_EQ(countCommands("macsec_mka_list"), 1u);
+
+        firePollTimer(macsecmgr);
+        EXPECT_EQ(countCommands("macsec_mka_list"), 2u);
+    }
+
+    // A failed query says nothing about the KaY, only about reaching it.
+    TEST_F(MACsecMgrTest, queryFailureRetainsTheLastKnownState)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+
+        const std::string last_updated = sessionField(PORT_NAME, "last_updated");
+        ASSERT_FALSE(last_updated.empty());
+
+        g_failing_command = "macsec_mka_list";
+        firePollTimer(macsecmgr);
+
+        EXPECT_EQ(sessionField(PORT_NAME, "query_status"), "error");
+        EXPECT_EQ(sessionField(PORT_NAME, "kay_status"), "active");
+        EXPECT_EQ(sessionField(PORT_NAME, "actor_sci"), "5254001234560001");
+        // Freshness must not advance across a failure.
+        EXPECT_EQ(sessionField(PORT_NAME, "last_updated"), last_updated);
+        EXPECT_EQ(participantKeys().size(), 1u);
+    }
+
+    // With nothing ever collected, success shaped defaults would be read as a
+    // real idle KaY. Only what is actually known is published.
+    TEST_F(MACsecMgrTest, firstQueryFailurePublishesOnlyKnownMetadata)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A);
+        bindPort(PORT_NAME);
+        g_failing_command = "macsec_mka_list";
+        enablePort(macsecmgr);
+
+        EXPECT_EQ(sessionField(PORT_NAME, "profile"), PROFILE_NAME);
+        EXPECT_EQ(sessionField(PORT_NAME, "query_status"), "error");
+        EXPECT_FALSE(hasSessionField(PORT_NAME, "kay_status"));
+        EXPECT_FALSE(hasSessionField(PORT_NAME, "last_updated"));
+        EXPECT_TRUE(participantKeys().empty());
+    }
+
+    // Collection has to stay bounded: a wpa_supplicant blocked elsewhere holds
+    // the ctrl interface for its whole timeout, and there is one query per port.
+    TEST_F(MACsecMgrTest, statusQueriesCarryADeadline)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+        firePollTimer(macsecmgr);
+
+        const auto queries = commandsMatching("macsec_mka_list");
+        ASSERT_EQ(queries.size(), 1u);
+        EXPECT_EQ(queries.front().find("/usr/bin/timeout "), 0u);
+    }
+
+    // Disable is authoritative: no refresh will ever correct these rows.
+    TEST_F(MACsecMgrTest, disableRemovesTheMkaState)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+        ASSERT_EQ(participantKeys().size(), 2u);
+
+        swss::Table port_table(m_config_db.get(), CFG_PORT_TABLE_NAME);
+        port_table.del(PORT_NAME);
+        port_table.set(PORT_NAME, { { "macsec", "" } });
+        macsecmgr.addExistingData(&port_table);
+        macsecmgr.doTask();
+
+        EXPECT_FALSE(hasSessionField(PORT_NAME, "query_status"));
+        EXPECT_TRUE(participantKeys().empty());
+    }
+
+    // Rotation republishes between the two halves, so the window where the port
+    // runs on the fallback CA alone is visible rather than inferred.
+    TEST_F(MACsecMgrTest, rotationRepublishesAfterEachParticipantChange)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+
+        setProfile(CAK_PRIMARY_B, CKN_PRIMARY_B, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        updateProfile(macsecmgr);
+
+        // One query after the delete and one after the add.
+        EXPECT_GE(countCommands("macsec_mka_list"), 2u);
+        EXPECT_EQ(participantKeys().size(), 2u);
+        EXPECT_EQ(participantField(PORT_NAME, CKN_PRIMARY_B, "is_fallback"), "false");
+        // The rotated out CKN is gone rather than left behind as a live CA.
+        EXPECT_EQ(participantField(PORT_NAME, CKN_PRIMARY_A, "is_fallback"), "");
+    }
+
+    // State is keyed by interface, so nothing a port publishes can be read as
+    // another port's, and no row is written for an interface that has none.
+    TEST_F(MACsecMgrTest, stateIsKeyedPerInterface)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+
+        const std::vector<std::string> keys = participantKeys();
+        ASSERT_EQ(keys.size(), 2u);
+        for (const auto & key : keys)
+        {
+            EXPECT_EQ(key.find(std::string(PORT_NAME) + "|"), 0u);
+        }
+        EXPECT_FALSE(hasSessionField("Ethernet4", "query_status"));
+    }
+
+    // The CKN is publishable, the CAK never is. Nothing in either table may
+    // carry key material.
+    TEST_F(MACsecMgrTest, noSecretMaterialReachesTheStateDb)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+
+        swss::Table session_table(
+            m_state_db.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+        swss::Table participant_table(
+            m_state_db.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
+
+        std::vector<swss::FieldValueTuple> published;
+        session_table.get(PORT_NAME, published);
+        ASSERT_FALSE(published.empty());
+        for (const auto & key : participantKeys())
+        {
+            std::vector<swss::FieldValueTuple> fvs;
+            participant_table.get(key, fvs);
+            published.insert(published.end(), fvs.begin(), fvs.end());
+        }
+
+        for (const auto & fv : published)
+        {
+            EXPECT_EQ(fvValue(fv).find(DECODED_CAK_PRIMARY_A), std::string::npos);
+            EXPECT_EQ(fvValue(fv).find(DECODED_CAK_FALLBACK_A), std::string::npos);
+            EXPECT_EQ(fvValue(fv).find(CAK_PRIMARY_A), std::string::npos);
+            EXPECT_EQ(fvValue(fv).find(CAK_FALLBACK_A), std::string::npos);
+        }
     }
 }
