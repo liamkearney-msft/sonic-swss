@@ -389,7 +389,11 @@ bool MACsecMgr::MACsecProfile::update(const TaskArgs & ta)
     // operator HDEL of fallback_cak/fallback_ckn) must not retain the old key.
     fallback_cak.clear();
     fallback_ckn.clear();
-    if (GetValue(ta, fallback_cak) && !GetValue(ta, fallback_ckn))
+    // Both halves are read before either is judged, so that a CKN without a CAK
+    // is rejected rather than quietly dropped along with the fallback.
+    const bool has_fallback_cak = GetValue(ta, fallback_cak);
+    const bool has_fallback_ckn = GetValue(ta, fallback_ckn);
+    if (has_fallback_cak != has_fallback_ckn)
     {
         return false;
     }
@@ -1042,7 +1046,7 @@ bool MACsecMgr::unconfigureMACsec(
     return true;
 }
 
-std::vector<MACsecMgr::MKAParticipant> MACsecMgr::getMKAParticipants(
+boost::optional<std::vector<MACsecMgr::MKAParticipant>> MACsecMgr::getMKAParticipants(
     const std::string & sock,
     const std::string & port_name) const
 {
@@ -1061,7 +1065,17 @@ std::vector<MACsecMgr::MKAParticipant> MACsecMgr::getMKAParticipants(
             "Cannot query MKA participants on port '%s' : %s",
             port_name.c_str(),
             e.what());
-        return participants;
+        return boost::none;
+    }
+
+    // A rejected command answers on the socket but carries no status, so it
+    // must not be read as a port with nothing running on it.
+    if (output.rfind("FAIL", 0) == 0)
+    {
+        SWSS_LOG_WARN(
+            "Cannot query MKA participants on port '%s' : the request was rejected",
+            port_name.c_str());
+        return boost::none;
     }
 
     // macsec_mka_list emits top-level 'key=value' fields followed by one block
@@ -1127,7 +1141,20 @@ bool MACsecMgr::addMKA(
 {
     SWSS_LOG_ENTER();
 
-    const auto * present = findParticipant(getMKAParticipants(sock, port_name), ckn);
+    // Held by value: findParticipant returns a pointer into this vector, so it
+    // has to outlive the pointer.
+    const auto participants = getMKAParticipants(sock, port_name);
+    if (!participants)
+    {
+        SWSS_LOG_WARN(
+            "Cannot add MKA participant CKN '%s' on port '%s' : the participants "
+            "already present could not be queried",
+            ckn.c_str(),
+            port_name.c_str());
+        return false;
+    }
+
+    const auto * present = findParticipant(*participants, ckn);
     if (present != nullptr)
     {
         // Already in the requested role, so there is nothing to do. In the other
@@ -1181,7 +1208,21 @@ bool MACsecMgr::delMKA(
 {
     SWSS_LOG_ENTER();
 
-    if (findParticipant(getMKAParticipants(sock, port_name), ckn) == nullptr)
+    const auto participants = getMKAParticipants(sock, port_name);
+    if (!participants)
+    {
+        // An unreachable ctrl interface says nothing about what is running
+        // behind it. Reporting the delete as done here would let a rotation
+        // continue over a participant that is still live.
+        SWSS_LOG_WARN(
+            "Cannot delete MKA participant CKN '%s' on port '%s' : the "
+            "participants present could not be queried",
+            ckn.c_str(),
+            port_name.c_str());
+        return false;
+    }
+
+    if (findParticipant(*participants, ckn) == nullptr)
     {
         SWSS_LOG_NOTICE(
             "MKA participant CKN '%s' not present on port '%s'; nothing to delete",

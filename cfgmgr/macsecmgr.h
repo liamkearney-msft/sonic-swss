@@ -5,6 +5,8 @@
 #include <swss/schema.h>
 #include <swss/boolean.h>
 
+#include <boost/optional.hpp>
+
 #include <cinttypes>
 #include <map>
 #include <vector>
@@ -114,7 +116,9 @@ private:
         const std::string & sock,
         const std::string & port_name,
         const std::string & ckn) const;
-    std::vector<MKAParticipant> getMKAParticipants(
+    // Returns boost::none when the port could not be queried. That is not the
+    // same answer as an empty list, and callers must not treat it as one.
+    boost::optional<std::vector<MKAParticipant>> getMKAParticipants(
         const std::string & sock,
         const std::string & port_name) const;
     // Apply 'profile' to a live port with runtime commands instead of restarting

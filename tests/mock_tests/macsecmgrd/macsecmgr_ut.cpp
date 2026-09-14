@@ -922,6 +922,52 @@ namespace macsecmgr_ut
         EXPECT_EQ(g_participants.front().ckn, CKN_PRIMARY_A);
     }
 
+    // A control socket that cannot be read says nothing about what is running
+    // behind it. A rotation that cannot see the participants must leave the live
+    // primary in place rather than assume it has already gone.
+    TEST_F(MACsecMgrTest, mkaListFailureRefusesPrimaryRotation)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+        ASSERT_EQ(g_participants.size(), 2);
+
+        g_failing_command = "macsec_mka_list";
+        setProfile(CAK_PRIMARY_B, CKN_PRIMARY_B, CAK_FALLBACK_A, CKN_FALLBACK_A);
+        updateProfile(macsecmgr);
+
+        // Nothing was retired, and nothing was staged on top of what is running.
+        EXPECT_EQ(countCommands("macsec_del_mka"), 0);
+        EXPECT_EQ(countCommands("macsec_add_mka"), 0);
+        ASSERT_EQ(g_participants.size(), 2);
+        EXPECT_NE(findFakeParticipant(CKN_PRIMARY_A), nullptr);
+        EXPECT_EQ(findFakeParticipant(CKN_PRIMARY_B), nullptr);
+    }
+
+    // The fallback CAK and CKN are a pair. A profile carrying one half is a
+    // misconfiguration, and must be refused rather than applied as a profile
+    // that silently has no standby at all.
+    TEST_F(MACsecMgrTest, halfConfiguredFallbackIsRejected)
+    {
+        swss::MACsecMgr macsecmgr(
+            m_config_db.get(), m_state_db.get(), cfg_macsec_tables);
+        setPortStateOk(PORT_NAME);
+        setProfile(CAK_PRIMARY_A, CKN_PRIMARY_A);
+        // A table set merges fields, so this leaves the CKN without its CAK.
+        swss::Table profile_table(
+            m_config_db.get(), CFG_MACSEC_PROFILE_TABLE_NAME);
+        profile_table.set(PROFILE_NAME, { { "fallback_ckn", CKN_FALLBACK_A } });
+        bindPort(PORT_NAME);
+        enablePort(macsecmgr);
+
+        // The profile was never loaded, so no port came up on it.
+        EXPECT_EQ(countCommands("macsec_add_mka"), 0);
+        EXPECT_TRUE(g_participants.empty());
+    }
+
     // macsec_mka_list carries KaY-level 'key=value' lines before the first
     // participant block, which must not be mistaken for participant fields.
     TEST_F(MACsecMgrTest, mkaListHeaderLinesAreNotParsedAsParticipants)
