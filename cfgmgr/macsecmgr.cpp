@@ -1756,12 +1756,7 @@ bool MACsecMgr::reconcileParticipant(
     if (!oldCkn.empty() &&
         (!pending || (haveStatus && findParticipant(status, oldCkn) != nullptr)))
     {
-        if (!removeParticipant(port_name, session, oldCkn))
-        {
-            setConfigState(port_name, session, "failed to remove selected participant");
-            return false;
-        }
-
+        const bool removeAccepted = removeParticipant(port_name, session, oldCkn);
         session.pending_old_ckn = oldCkn;
         session.pending_primary = primary;
         session.pending_new_ckn = primary ? replacement.primary_ckn : replacement.fallback_ckn;
@@ -1777,7 +1772,10 @@ bool MACsecMgr::reconcileParticipant(
             session.applied_profile.fallback_ckn.clear();
             session.applied_profile.fallback_cak.clear();
         }
-        setConfigState(port_name, session, "selected participant removed; replacement pending");
+        setConfigState(
+            port_name, session,
+            removeAccepted ? "selected participant removed; replacement pending" :
+                             "selected participant removal is unverified");
 
         MKASessionStatus postRemoveStatus;
         if (collectMKAStatus(port_name, session, &postRemoveStatus))
@@ -1791,6 +1789,10 @@ bool MACsecMgr::reconcileParticipant(
             {
                 return true;
             }
+        }
+        else if (!removeAccepted)
+        {
+            return false;
         }
     }
 
