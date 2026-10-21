@@ -825,7 +825,7 @@ TEST_F(MACsecMgrTest, WpaDiagnosticsUseDecodedExitAndSignalStatuses)
     EXPECT_TRUE(wpaPipeStatuses.empty());
 }
 
-TEST_F(MACsecMgrTest, DeferredConfigIsConsumedAndOnlyTimerRetriesRuntime)
+TEST_F(MACsecMgrTest, QueryFailureDoesNotBlockInitialCommandsAndTimerObservesResult)
 {
     auto &blocked = session("Ethernet0");
     auto &ready = session("Ethernet4");
@@ -837,7 +837,9 @@ TEST_F(MACsecMgrTest, DeferredConfigIsConsumedAndOnlyTimerRetriesRuntime)
     manager->doTask();
     ASSERT_TRUE(consumer->m_toSync.empty());
     EXPECT_EQ(NEW_PRIMARY_CKN, manager->m_profiles["profile"].primary_ckn);
-    EXPECT_EQ(PRIMARY_CKN, blocked.applied_profile.primary_ckn);
+    EXPECT_TRUE(blocked.applied_profile.primary_ckn.empty());
+    EXPECT_EQ(NEW_PRIMARY_CKN, commandState.primaryCknByPort["Ethernet0"]);
+    EXPECT_EQ(PRIMARY_CKN, blocked.pending_old_ckn);
     EXPECT_EQ(NEW_PRIMARY_CKN, ready.applied_profile.primary_ckn);
 
     const auto forks = wpaProcessCount;
@@ -863,8 +865,8 @@ TEST_F(MACsecMgrTest, DeferredConfigIsConsumedAndOnlyTimerRetriesRuntime)
     ASSERT_NE(nullptr, timer);
     timer->execute();
     EXPECT_EQ(forks + 2, wpaProcessCount);
-    EXPECT_EQ(blockedWrites + 3, testing_db::writeCount(
-        STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet0"));
+    EXPECT_GT(testing_db::writeCount(
+        STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet0"), blockedWrites);
     EXPECT_EQ(readyWrites + 3, testing_db::writeCount(
         STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet4"));
 
@@ -875,7 +877,7 @@ TEST_F(MACsecMgrTest, DeferredConfigIsConsumedAndOnlyTimerRetriesRuntime)
     EXPECT_TRUE(consumer->m_toSync.empty());
 }
 
-TEST_F(MACsecMgrTest, PolicyDeferralRecoversOnTimerAndNewConfigAttemptsPromptly)
+TEST_F(MACsecMgrTest, PeerlessAlternateDoesNotDeferCommandsOrRequireTimer)
 {
     auto &runtime = session();
     manager->m_startupStateReconciled = true;
@@ -885,7 +887,8 @@ TEST_F(MACsecMgrTest, PolicyDeferralRecoversOnTimerAndNewConfigAttemptsPromptly)
     consumer->addToSync(KeyOpFieldsValuesTuple("profile", SET_COMMAND, profileArgs(NEW_PRIMARY_CKN)));
     manager->doTask();
     ASSERT_TRUE(consumer->m_toSync.empty());
-    EXPECT_EQ(0, commandState.addCalls);
+    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_EQ(NEW_PRIMARY_CKN, runtime.applied_profile.primary_ckn);
     const auto writes = testing_db::writeCount(
         STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet0");
     const auto forks = wpaProcessCount;
@@ -897,7 +900,6 @@ TEST_F(MACsecMgrTest, PolicyDeferralRecoversOnTimerAndNewConfigAttemptsPromptly)
     EXPECT_EQ(writes, testing_db::writeCount(
         STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet0"));
 
-    commandState.peerCountsByPort["Ethernet0"].fallbackLive = 1;
     auto timer = dynamic_cast<ExecutableTimer *>(executor("MACSEC_MKA_STATUS_TIMER"));
     ASSERT_NE(nullptr, timer);
     timer->execute();
@@ -986,6 +988,32 @@ TEST_F(MACsecMgrTest, FailedFallbackAddRecoversOnTimerWithoutConfigReplay)
     }));
 }
 
+TEST_F(MACsecMgrTest, RejectedNetworkUpdateRetriesInPlaceWithoutRemovingAgain)
+{
+    auto &runtime = session();
+    commandState.failOperation = "mka_ckn_fallback";
+    commandState.failureOutput = "FAIL\n";
+
+    EXPECT_EQ(task_success, manager->loadProfile(
+        "profile", profileArgs(PRIMARY_CKN, NEW_FALLBACK_CKN)));
+    EXPECT_EQ(FALLBACK_CKN, runtime.pending_old_ckn);
+    EXPECT_EQ(0, commandState.addCalls);
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    string status;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("degraded", status);
+
+    commandState.failOperation.clear();
+    manager->sweepMKAStatus();
+    EXPECT_EQ(NEW_FALLBACK_CKN, runtime.applied_profile.fallback_ckn);
+    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_EQ(1, count_if(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+        return cmd.find("macsec_del_mka") != string::npos;
+    }));
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("in-sync", status);
+}
+
 TEST_F(MACsecMgrTest, QueryFailurePreservesLastSuccessfulSnapshot)
 {
     auto &mkaSession = session();
@@ -1007,6 +1035,115 @@ TEST_F(MACsecMgrTest, QueryFailurePreservesLastSuccessfulSnapshot)
     vector<FieldValueTuple> participantValues;
     EXPECT_TRUE(participantTable.get("Ethernet0|" + PRIMARY_CKN, participantValues));
     EXPECT_FALSE(fvsGetValue(participantValues, "participant", true));
+}
+
+TEST_F(MACsecMgrTest, UnexpectedParticipantIsPublishedButNotReportedInSync)
+{
+    auto &mkaSession = session();
+    commandState.primaryCknByPort["Ethernet0"] = NEW_PRIMARY_CKN;
+
+    EXPECT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    Table participantTable(stateDb.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
+    string value;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "query_status", value));
+    EXPECT_EQ("ok", value);
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", value));
+    EXPECT_EQ("degraded", value);
+    vector<FieldValueTuple> fields;
+    EXPECT_TRUE(participantTable.get("Ethernet0|" + NEW_PRIMARY_CKN, fields));
+
+    commandState.primaryCknByPort["Ethernet0"] = PRIMARY_CKN;
+    EXPECT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", value));
+    EXPECT_EQ("in-sync", value);
+}
+
+TEST_F(MACsecMgrTest, TimerRestoresParticipantMissingAfterPreviouslyVerifiedState)
+{
+    auto &mkaSession = session();
+    ASSERT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
+    commandState.primaryCknByPort["Ethernet0"].clear();
+
+    manager->sweepMKAStatus();
+
+    EXPECT_EQ(PRIMARY_CKN, commandState.primaryCknByPort["Ethernet0"]);
+    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_TRUE(none_of(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+        return cmd.find("macsec_del_mka") != string::npos ||
+               cmd.find("interface_remove") != string::npos;
+    }));
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    string status;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("in-sync", status);
+}
+
+TEST_F(MACsecMgrTest, TimerReplacesOutOfBandCknDriftWithoutRestart)
+{
+    auto &mkaSession = session();
+    ASSERT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
+    commandState.primaryCknByPort["Ethernet0"] = NEW_PRIMARY_CKN;
+
+    manager->sweepMKAStatus();
+
+    EXPECT_EQ(PRIMARY_CKN, commandState.primaryCknByPort["Ethernet0"]);
+    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_EQ(1, count_if(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+        return cmd.find("macsec_del_mka") != string::npos &&
+               cmd.find(NEW_PRIMARY_CKN) != string::npos;
+    }));
+    EXPECT_TRUE(none_of(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+        return cmd.find("interface_remove") != string::npos ||
+               cmd.find("interface_add") != string::npos;
+    }));
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    string status;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("in-sync", status);
+}
+
+TEST_F(MACsecMgrTest, TimerRetriesMissingParticipantAddWithoutRepeatedRemoval)
+{
+    auto &mkaSession = session();
+    ASSERT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
+    commandState.fallbackCknByPort["Ethernet0"].clear();
+    commandState.failFallbackAdd = true;
+
+    manager->sweepMKAStatus();
+    EXPECT_EQ(1, commandState.addCalls);
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    string status;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("degraded", status);
+
+    commandState.failFallbackAdd = false;
+    manager->sweepMKAStatus();
+    EXPECT_EQ(2, commandState.addCalls);
+    EXPECT_EQ(FALLBACK_CKN, commandState.fallbackCknByPort["Ethernet0"]);
+    EXPECT_TRUE(none_of(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+        return cmd.find("macsec_del_mka") != string::npos;
+    }));
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("in-sync", status);
+}
+
+TEST_F(MACsecMgrTest, TimerObservesAmbiguousRestorationBeforeAddingAgain)
+{
+    auto &mkaSession = session();
+    ASSERT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
+    commandState.fallbackCknByPort["Ethernet0"].clear();
+    commandState.addAppliedButFailed = true;
+
+    manager->sweepMKAStatus();
+    EXPECT_EQ(1, commandState.addCalls);
+    commandState.addAppliedButFailed = false;
+    manager->sweepMKAStatus();
+    EXPECT_EQ(1, commandState.addCalls);
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    string status;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("in-sync", status);
 }
 
 TEST_F(MACsecMgrTest, ExplicitDisableDeletesOperationalRows)
@@ -1118,7 +1255,7 @@ TEST(MACsecMgrRestart, RetainsConfiguredRowsAndDeletesOrphans)
     EXPECT_FALSE(participantTable.get("Ethernet4|" + PRIMARY_CKN, values));
 }
 
-TEST_F(MACsecMgrTest, SecuredSessionPrimaryRolloverRemovesBeforeAdding)
+TEST_F(MACsecMgrTest, PrimaryRolloverRemovesBeforeAddingWithoutRestart)
 {
     auto &mkaSession = session();
     auto desired = profile(NEW_PRIMARY_CKN);
@@ -1136,20 +1273,26 @@ TEST_F(MACsecMgrTest, SecuredSessionPrimaryRolloverRemovesBeforeAdding)
     ASSERT_NE(mockCallArgs.end(), add);
     EXPECT_LT(distance(mockCallArgs.begin(), remove), distance(mockCallArgs.begin(), add));
     EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_TRUE(none_of(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+        return cmd.find("interface_remove") != string::npos ||
+               cmd.find("interface_add") != string::npos ||
+               cmd.find("enable_network") != string::npos;
+    }));
 }
 
-TEST_F(MACsecMgrTest, AuthenticatedButUnsecuredSessionFailsRolloverPreflight)
+TEST_F(MACsecMgrTest, AuthenticatedUnsecuredSessionStillRotatesInPlace)
 {
     auto &mkaSession = session();
     auto desired = profile(NEW_PRIMARY_CKN);
     manager->m_profiles["profile"] = desired;
     commandState.authenticated = true;
     commandState.secured = false;
+    commandState.peerCountsByPort["Ethernet0"].fallbackLive = 0;
 
-    EXPECT_FALSE(manager->reconcilePort("Ethernet0", mkaSession, desired));
-    EXPECT_EQ(0, commandState.addCalls);
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
-    EXPECT_TRUE(none_of(
+    EXPECT_TRUE(manager->reconcilePort("Ethernet0", mkaSession, desired));
+    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_TRUE(any_of(
         mockCallArgs.begin(),
         mockCallArgs.end(),
         [](const string &cmd) {
@@ -1157,7 +1300,7 @@ TEST_F(MACsecMgrTest, AuthenticatedButUnsecuredSessionFailsRolloverPreflight)
         }));
 }
 
-TEST_F(MACsecMgrTest, UnsafeFirstPortDoesNotBlockLaterSafePort)
+TEST_F(MACsecMgrTest, QueryFailureOnOnePortDoesNotBlockOtherPorts)
 {
     auto &unsafeSession = session("Ethernet0");
     auto &safeSession = session("Ethernet4");
@@ -1167,11 +1310,11 @@ TEST_F(MACsecMgrTest, UnsafeFirstPortDoesNotBlockLaterSafePort)
         manager->loadProfile("profile", profileArgs(NEW_PRIMARY_CKN)));
 
     EXPECT_EQ(NEW_PRIMARY_CKN, manager->m_profiles["profile"].primary_ckn);
-    EXPECT_EQ(PRIMARY_CKN, unsafeSession.applied_profile.primary_ckn);
+    EXPECT_TRUE(unsafeSession.applied_profile.primary_ckn.empty());
     EXPECT_EQ(NEW_PRIMARY_CKN, safeSession.applied_profile.primary_ckn);
-    EXPECT_EQ(PRIMARY_CKN, commandState.primaryCknByPort["Ethernet0"]);
+    EXPECT_EQ(NEW_PRIMARY_CKN, commandState.primaryCknByPort["Ethernet0"]);
     EXPECT_EQ(NEW_PRIMARY_CKN, commandState.primaryCknByPort["Ethernet4"]);
-    EXPECT_TRUE(none_of(
+    EXPECT_TRUE(any_of(
         mockCallArgs.begin(),
         mockCallArgs.end(),
         [](const string &cmd) {
@@ -1208,7 +1351,7 @@ TEST_F(MACsecMgrTest, MultipleSafePortsAllRotate)
     EXPECT_EQ(3, commandState.addCalls);
 }
 
-TEST_F(MACsecMgrTest, DeferredPortRecoversWithoutReapplyingCompletedPort)
+TEST_F(MACsecMgrTest, PendingPortObservesAmbiguousAddWithoutReapplyingCompletedPort)
 {
     auto &deferredSession = session("Ethernet0");
     auto &completedSession = session("Ethernet4");
@@ -1216,7 +1359,7 @@ TEST_F(MACsecMgrTest, DeferredPortRecoversWithoutReapplyingCompletedPort)
 
     EXPECT_EQ(task_success,
         manager->loadProfile("profile", profileArgs(NEW_PRIMARY_CKN)));
-    ASSERT_EQ(1, commandState.addCalls);
+    ASSERT_EQ(2, commandState.addCalls);
     ASSERT_EQ(NEW_PRIMARY_CKN, completedSession.applied_profile.primary_ckn);
 
     commandState.failQueryPorts.clear();
@@ -1256,7 +1399,30 @@ TEST_F(MACsecMgrTest, DesiredProfileIsCachedWithoutRuntimeSession)
     EXPECT_TRUE(mockCallArgs.empty());
 }
 
-TEST_F(MACsecMgrTest, PrimaryOnlyDesiredChangeIsCachedButRuntimeMutationIsDeferred)
+TEST_F(MACsecMgrTest, FallbackPresenceChangesRemainUnsupported)
+{
+    auto &mkaSession = session();
+    auto desired = primaryOnlyProfile();
+    manager->m_profiles["profile"] = desired;
+
+    EXPECT_FALSE(manager->reconcilePort("Ethernet0", mkaSession, desired));
+    EXPECT_EQ(0, commandState.addCalls);
+    EXPECT_TRUE(none_of(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+        return cmd.find("macsec_del_mka") != string::npos;
+    }));
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    string status;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("degraded", status);
+
+    mkaSession.applied_profile = primaryOnlyProfile();
+    desired = profile();
+    manager->m_profiles["profile"] = desired;
+    EXPECT_FALSE(manager->reconcilePort("Ethernet0", mkaSession, desired));
+    EXPECT_EQ(0, commandState.addCalls);
+}
+
+TEST_F(MACsecMgrTest, PrimaryOnlyProfileRotatesWithoutManagerAlternateGuarantee)
 {
     auto &mkaSession = session();
     mkaSession.applied_profile = primaryOnlyProfile();
@@ -1267,25 +1433,24 @@ TEST_F(MACsecMgrTest, PrimaryOnlyDesiredChangeIsCachedButRuntimeMutationIsDeferr
         manager->loadProfile("profile", primaryOnlyProfileArgs(NEW_PRIMARY_CKN)));
 
     EXPECT_EQ(NEW_PRIMARY_CKN, manager->m_profiles["profile"].primary_ckn);
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
     EXPECT_TRUE(any_of(
         mockCallArgs.begin(),
         mockCallArgs.end(),
         [](const string &cmd) {
             return cmd.find("macsec_mka_list") != string::npos;
         }));
-    EXPECT_TRUE(none_of(
+    EXPECT_TRUE(any_of(
         mockCallArgs.begin(),
         mockCallArgs.end(),
         [](const string &cmd) {
-            return cmd.find("macsec_del_mka") != string::npos ||
-                   cmd.find("macsec_add_mka") != string::npos;
+            return cmd.find("macsec_del_mka") != string::npos;
         }));
 
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
     string configStatus;
     ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", configStatus));
-    EXPECT_EQ("degraded", configStatus);
+    EXPECT_EQ("in-sync", configStatus);
 }
 
 TEST_F(MACsecMgrTest, PeerlessPrimaryOnlyDesiredChangeAppliesImmediately)
@@ -1320,7 +1485,7 @@ TEST_F(MACsecMgrTest, PeerlessPrimaryOnlyDesiredChangeAppliesImmediately)
         }));
 }
 
-TEST_F(MACsecMgrTest, PotentialPeerPreventsNoPeerBypass)
+TEST_F(MACsecMgrTest, PotentialPeerDoesNotVetoLiveRekey)
 {
     auto &mkaSession = session();
     mkaSession.applied_profile = primaryOnlyProfile();
@@ -1332,17 +1497,16 @@ TEST_F(MACsecMgrTest, PotentialPeerPreventsNoPeerBypass)
     EXPECT_EQ(task_success,
         manager->loadProfile("profile", primaryOnlyProfileArgs(NEW_PRIMARY_CKN)));
 
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
-    EXPECT_TRUE(none_of(
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_TRUE(any_of(
         mockCallArgs.begin(),
         mockCallArgs.end(),
         [](const string &cmd) {
-            return cmd.find("macsec_del_mka") != string::npos ||
-                   cmd.find("macsec_add_mka") != string::npos;
+            return cmd.find("macsec_add_mka") != string::npos;
         }));
 }
 
-TEST_F(MACsecMgrTest, QueryFailureDoesNotTriggerNoPeerBypass)
+TEST_F(MACsecMgrTest, QueryFailureDoesNotVetoInitialCommandsOrClaimConvergence)
 {
     auto &mkaSession = session();
     mkaSession.applied_profile = primaryOnlyProfile();
@@ -1354,17 +1518,28 @@ TEST_F(MACsecMgrTest, QueryFailureDoesNotTriggerNoPeerBypass)
     EXPECT_EQ(task_success,
         manager->loadProfile("profile", primaryOnlyProfileArgs(NEW_PRIMARY_CKN)));
 
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
-    EXPECT_TRUE(none_of(
+    EXPECT_TRUE(mkaSession.applied_profile.primary_ckn.empty());
+    EXPECT_EQ(PRIMARY_CKN, mkaSession.pending_old_ckn);
+    EXPECT_EQ(NEW_PRIMARY_CKN, commandState.primaryCknByPort["Ethernet0"]);
+    EXPECT_TRUE(any_of(
         mockCallArgs.begin(),
         mockCallArgs.end(),
         [](const string &cmd) {
-            return cmd.find("macsec_del_mka") != string::npos ||
-                   cmd.find("macsec_add_mka") != string::npos;
+            return cmd.find("macsec_add_mka") != string::npos;
         }));
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    string status;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "query_status", status));
+    EXPECT_EQ("error", status);
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
+    EXPECT_EQ("degraded", status);
+    commandState.failQueryPorts.clear();
+    EXPECT_EQ(task_success, manager->loadProfile("profile", primaryOnlyProfileArgs(NEW_PRIMARY_CKN)));
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_EQ(1, commandState.addCalls);
 }
 
-TEST_F(MACsecMgrTest, PeerAppearingOnImmediateRecheckPreventsRemoval)
+TEST_F(MACsecMgrTest, PeerAppearingDuringObservationDoesNotVetoCommands)
 {
     auto &mkaSession = session();
     mkaSession.applied_profile = primaryOnlyProfile();
@@ -1377,13 +1552,12 @@ TEST_F(MACsecMgrTest, PeerAppearingOnImmediateRecheckPreventsRemoval)
         manager->loadProfile("profile", primaryOnlyProfileArgs(NEW_PRIMARY_CKN)));
 
     EXPECT_EQ(2u, commandState.queryCountByPort["Ethernet0"]);
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
-    EXPECT_TRUE(none_of(
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_TRUE(any_of(
         mockCallArgs.begin(),
         mockCallArgs.end(),
         [](const string &cmd) {
-            return cmd.find("macsec_del_mka") != string::npos ||
-                   cmd.find("macsec_add_mka") != string::npos;
+            return cmd.find("macsec_add_mka") != string::npos;
         }));
 }
 
@@ -1413,7 +1587,7 @@ TEST_F(MACsecMgrTest, PeerlessDualParticipantUpdateCompletesInOneReconciliation)
     EXPECT_EQ(2, commandState.addCalls);
     EXPECT_EQ(NEW_PRIMARY_CKN, commandState.networkPrimaryCknByPort["Ethernet0"]);
     EXPECT_EQ(NEW_FALLBACK_CKN, commandState.networkFallbackCknByPort["Ethernet0"]);
-    EXPECT_GE(commandState.queryCountByPort["Ethernet0"], 6u);
+    EXPECT_GE(commandState.queryCountByPort["Ethernet0"], 4u);
 }
 
 TEST_F(MACsecMgrTest, PeerlessRemoveFailureDoesNotClaimSuccess)
@@ -1467,6 +1641,10 @@ TEST_F(MACsecMgrTest, FallbackRolloverKeepsPrimaryAndAddsBestEffort)
                    cmd.find("fallback=1") != string::npos;
         });
     EXPECT_NE(mockCallArgs.end(), add);
+    EXPECT_TRUE(none_of(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+        return cmd.find("interface_remove") != string::npos ||
+               cmd.find("interface_add") != string::npos;
+    }));
 }
 
 TEST_F(MACsecMgrTest, RetryRecognizesReplacementAfterAmbiguousAddFailure)
@@ -1555,18 +1733,16 @@ TEST_F(MACsecMgrTest, QueuedPrimaryThenFallbackUsesAppliedAlternate)
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, NEW_FALLBACK_CKN)));
     EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
-    EXPECT_EQ(FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
-    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
+    EXPECT_EQ(2, commandState.addCalls);
 
-    // The new primary must gain a live peer before it can protect fallback removal.
-    commandState.peerCountsByPort["Ethernet0"].primaryLive = 1;
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, NEW_FALLBACK_CKN)));
     EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
     EXPECT_EQ(2, commandState.addCalls);
 }
 
-TEST_F(MACsecMgrTest, QueuedFallbackThenPrimarySelectsLiveAppliedPrimary)
+TEST_F(MACsecMgrTest, QueuedFallbackThenPrimaryConvergesWithoutPeerChecks)
 {
     auto &mkaSession = session();
     commandState.failQuery = true;
@@ -1578,11 +1754,10 @@ TEST_F(MACsecMgrTest, QueuedFallbackThenPrimarySelectsLiveAppliedPrimary)
 
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, NEW_FALLBACK_CKN)));
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
     EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
-    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_EQ(2, commandState.addCalls);
 
-    commandState.peerCountsByPort["Ethernet0"].fallbackLive = 1;
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, NEW_FALLBACK_CKN)));
     EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
@@ -1604,14 +1779,14 @@ TEST_F(MACsecMgrTest, PendingFallbackAddRetriesBeforeQueuedPrimary)
     commandState.newParticipantsPeerless = true;
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, NEW_FALLBACK_CKN)));
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
     EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
     EXPECT_TRUE(mkaSession.pending_old_ckn.empty());
 
-    commandState.peerCountsByPort["Ethernet0"].fallbackLive = 1;
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, NEW_FALLBACK_CKN)));
     EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_EQ(3, commandState.addCalls);
 }
 
 TEST_F(MACsecMgrTest, AbsentPendingFallbackRestoresAfterAlternateLosesLivePeer)
@@ -1644,7 +1819,7 @@ TEST_F(MACsecMgrTest, AbsentPendingFallbackRestoresAfterAlternateLosesLivePeer)
     EXPECT_EQ("in-sync", value);
 }
 
-TEST_F(MACsecMgrTest, StillPresentPendingFallbackRequiresLiveAlternateBeforeRemove)
+TEST_F(MACsecMgrTest, StillPresentPendingFallbackIsRemovedAgainWithoutPeerChecks)
 {
     auto &mkaSession = session();
     commandState.failFallbackAdd = true;
@@ -1658,10 +1833,10 @@ TEST_F(MACsecMgrTest, StillPresentPendingFallbackRequiresLiveAlternateBeforeRemo
     commandState.peerCountsByPort["Ethernet0"].primaryPotential = 1;
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(PRIMARY_CKN, NEW_FALLBACK_CKN)));
-    EXPECT_TRUE(mkaSession.applied_profile.fallback_ckn.empty());
-    EXPECT_EQ(FALLBACK_CKN, mkaSession.pending_old_ckn);
-    EXPECT_EQ(1, commandState.addCalls);
-    EXPECT_EQ(1, count_if(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+    EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
+    EXPECT_TRUE(mkaSession.pending_old_ckn.empty());
+    EXPECT_EQ(2, commandState.addCalls);
+    EXPECT_EQ(2, count_if(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
         return cmd.find("macsec_del_mka") != string::npos;
     }));
 }
@@ -1688,7 +1863,7 @@ TEST_F(MACsecMgrTest, SupersededPendingFallbackCollisionUsesAttemptedTargetAsBri
     }));
 }
 
-TEST_F(MACsecMgrTest, BridgeRestorationDoesNotWaiveLaterRemovalSafety)
+TEST_F(MACsecMgrTest, BridgeRestorationConvergesEvenWithPeerlessParticipants)
 {
     auto &mkaSession = session();
     commandState.failFallbackAdd = true;
@@ -1701,10 +1876,10 @@ TEST_F(MACsecMgrTest, BridgeRestorationDoesNotWaiveLaterRemovalSafety)
     commandState.peerCountsByPort["Ethernet0"].primaryPotential = 1;
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, PRIMARY_CKN)));
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
-    EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.fallback_ckn);
     EXPECT_TRUE(mkaSession.pending_old_ckn.empty());
-    EXPECT_EQ(1, count_if(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+    EXPECT_EQ(3, count_if(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
         return cmd.find("macsec_del_mka") != string::npos;
     }));
 }
@@ -1738,14 +1913,16 @@ TEST_F(MACsecMgrTest, PendingFallbackQueryRecoversBeforeQueuedPrimary)
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, NEW_FALLBACK_CKN)));
     EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
-    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
-    EXPECT_TRUE(mkaSession.pending_old_ckn.empty());
-    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_TRUE(mkaSession.applied_profile.primary_ckn.empty());
+    EXPECT_EQ(PRIMARY_CKN, mkaSession.pending_old_ckn);
+    EXPECT_EQ(2, commandState.addCalls);
 
     commandState.failFirstPostAddQueryPorts.clear();
     commandState.peerCountsByPort["Ethernet0"].fallbackLive = 1;
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(NEW_PRIMARY_CKN, NEW_FALLBACK_CKN)));
+    EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+    EXPECT_TRUE(mkaSession.pending_old_ckn.empty());
     EXPECT_EQ(2, commandState.addCalls);
 }
 
@@ -1798,10 +1975,9 @@ TEST_F(MACsecMgrTest, SupersededPendingPrimaryIsObservedBeforeBothRolesConverge)
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(LATEST_PRIMARY_CKN, NEW_FALLBACK_CKN)));
     EXPECT_EQ(LATEST_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
-    EXPECT_EQ(FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
-    EXPECT_EQ(2, commandState.addCalls);
+    EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
+    EXPECT_EQ(3, commandState.addCalls);
 
-    commandState.peerCountsByPort["Ethernet0"].primaryLive = 1;
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(LATEST_PRIMARY_CKN, NEW_FALLBACK_CKN)));
     EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
@@ -1810,26 +1986,24 @@ TEST_F(MACsecMgrTest, SupersededPendingPrimaryIsObservedBeforeBothRolesConverge)
     EXPECT_EQ(NEW_FALLBACK_CKN, commandState.networkFallbackCknByPort["Ethernet0"]);
 }
 
-TEST_F(MACsecMgrTest, LosingAppliedAlternateOnImmediateRecheckPreventsRemove)
+TEST_F(MACsecMgrTest, LosingAlternatePeerDoesNotVetoFallbackUpdate)
 {
     auto &mkaSession = session();
     commandState.primaryPeerLostOnSecondQueryPorts.insert("Ethernet0");
 
     EXPECT_EQ(task_success, manager->loadProfile(
         "profile", profileArgs(PRIMARY_CKN, NEW_FALLBACK_CKN)));
-    EXPECT_EQ(FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
+    EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
     EXPECT_EQ(2u, commandState.queryCountByPort["Ethernet0"]);
-    EXPECT_EQ(0, commandState.addCalls);
-    EXPECT_TRUE(none_of(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
+    EXPECT_EQ(1, commandState.addCalls);
+    EXPECT_TRUE(any_of(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
         return cmd.find("macsec_del_mka") != string::npos;
     }));
 
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
     string value;
     ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", value));
-    EXPECT_EQ("degraded", value);
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_error", value));
-    EXPECT_EQ("alternate participant is not live and role-correct", value);
+    EXPECT_EQ("in-sync", value);
 }
 
 TEST_F(MACsecMgrTest, QueuedReplacementAvoidsCollisionWithAppliedAlternate)

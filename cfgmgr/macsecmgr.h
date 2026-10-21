@@ -79,6 +79,7 @@ public:
         // An ambiguous add must remain recognizable even if desired state changes.
         std::string pending_new_ckn;
         std::string pending_new_cak;
+        bool participants_verified = false;
         std::string config_error;
     };
 
@@ -123,8 +124,7 @@ private:
     bool collectMKAStatus(
         const std::string &port_name,
         MKASession &session,
-        MKASessionStatus *status = nullptr,
-        bool allowDesiredReplacement = false);
+        MKASessionStatus *status = nullptr);
     bool queryMKAStatus(
         const std::string &port_name,
         const MKASession &session,
@@ -133,7 +133,6 @@ private:
     bool validateExpectedParticipants(
         const MKASession &session,
         const MKASessionStatus &status,
-        bool allowDesiredReplacement,
         std::string &error) const;
     void publishMKAStatus(
         const std::string &port_name,
@@ -151,21 +150,20 @@ private:
     void reconcileStartupState();
     void doTask(SelectableTimer &timer) override;
     void sweepMKAStatus();
-    bool preflightRollover(
+    bool selectParticipantToUpdate(
         const std::string &port_name,
         MKASession &session,
         const MACsecProfile &desired,
         bool &primary);
-    bool validateRolloverStatus(
-        const std::string &port_name,
-        MKASession &session,
-        const MACsecProfile &desired,
-        const MKASessionStatus &status,
-        bool primary);
     bool reconcilePort(
         const std::string &port_name,
         MKASession &session,
         const MACsecProfile &desired);
+    bool reconcileObservedParticipants(
+        const std::string &port_name,
+        MKASession &session,
+        const MACsecProfile &desired,
+        const MKASessionStatus &status);
     bool reconcileParticipant(
         const std::string &port_name,
         MKASession &session,

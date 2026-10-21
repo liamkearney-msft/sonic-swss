@@ -205,22 +205,9 @@ static const MKAParticipantStatus *findParticipant(
     return participant == status.participants.end() ? nullptr : &*participant;
 }
 
-static bool hasNoPeers(const MKASessionStatus &status)
-{
-    return std::all_of(
-        status.participants.begin(),
-        status.participants.end(),
-        [](const MKAParticipantStatus &participant)
-        {
-            return participant.livePeers == 0 &&
-                   participant.potentialPeers == 0;
-        });
-}
-
 static bool selectPrimaryReplacement(
     const MACsecMgr::MKASession &session,
-    const MACsecMgr::MACsecProfile &desired,
-    const MKASessionStatus &status)
+    const MACsecMgr::MACsecProfile &desired)
 {
     if (!session.pending_old_ckn.empty())
     {
@@ -239,11 +226,7 @@ static bool selectPrimaryReplacement(
         return primaryChanged;
     }
 
-    const auto fallback = findParticipant(status, applied.fallback_ckn);
-    return desired.primary_ckn != applied.fallback_ckn &&
-           (hasNoPeers(status) ||
-            (fallback != nullptr && !fallback->isPrimary &&
-             fallback->active && fallback->livePeers != 0));
+    return desired.primary_ckn != applied.fallback_ckn;
 }
 
 static bool usePendingReplacement(
@@ -540,11 +523,22 @@ void MACsecMgr::sweepMKAStatus()
             (!sameProfile(port.second.applied_profile, desired->second) ||
              !port.second.pending_old_ckn.empty()))
         {
-            reconcilePort(port.first, port.second, desired->second);
+            if (!reconcilePort(port.first, port.second, desired->second) &&
+                port.second.pending_old_ckn.empty())
+            {
+                collectMKAStatus(port.first, port.second);
+            }
         }
         else
         {
-            collectMKAStatus(port.first, port.second);
+            MKASessionStatus status;
+            if (collectMKAStatus(port.first, port.second, &status) &&
+                !port.second.participants_verified &&
+                desired != m_profiles.end())
+            {
+                reconcileObservedParticipants(
+                    port.first, port.second, desired->second, status);
+            }
         }
     }
 }
@@ -1333,7 +1327,6 @@ bool MACsecMgr::queryMKAStatus(
 bool MACsecMgr::validateExpectedParticipants(
     const MKASession &session,
     const MKASessionStatus &status,
-    bool allowDesiredReplacement,
     std::string &error) const
 {
     std::map<std::string, bool> fixed;
@@ -1346,19 +1339,6 @@ bool MACsecMgr::validateExpectedParticipants(
         fixed.emplace(session.applied_profile.fallback_ckn, false);
     }
 
-    std::map<std::string, bool> alternatives;
-    if (allowDesiredReplacement && !session.pending_old_ckn.empty())
-    {
-        alternatives.emplace(session.pending_old_ckn, session.pending_primary);
-        if (!session.pending_new_ckn.empty())
-        {
-            alternatives.emplace(
-                session.pending_new_ckn,
-                session.pending_primary);
-        }
-    }
-
-    size_t alternativeCount = 0;
     for (const auto &participant : status.participants)
     {
         const auto expected = fixed.find(participant.ckn);
@@ -1372,14 +1352,8 @@ bool MACsecMgr::validateExpectedParticipants(
             continue;
         }
 
-        const auto alternative = alternatives.find(participant.ckn);
-        if (alternative == alternatives.end() ||
-            participant.isPrimary != alternative->second)
-        {
-            error = "runtime participant set differs from applied state";
-            return false;
-        }
-        ++alternativeCount;
+        error = "runtime participant set differs from applied state";
+        return false;
     }
 
     for (const auto &expected : fixed)
@@ -1391,8 +1365,7 @@ bool MACsecMgr::validateExpectedParticipants(
         }
     }
 
-    if (alternativeCount > 1 ||
-        status.participants.size() != fixed.size() + alternativeCount)
+    if (status.participants.size() != fixed.size())
     {
         error = "runtime participant set is ambiguous";
         return false;
@@ -1404,27 +1377,23 @@ bool MACsecMgr::validateExpectedParticipants(
 bool MACsecMgr::collectMKAStatus(
     const std::string &port_name,
     MKASession &session,
-    MKASessionStatus *statusResult,
-    bool allowDesiredReplacement)
+    MKASessionStatus *statusResult)
 {
     MKASessionStatus status;
     std::string error;
 
-    if (!queryMKAStatus(port_name, session, status, error) ||
-        !validateExpectedParticipants(
-            session,
-            status,
-            allowDesiredReplacement,
-            error))
+    if (!queryMKAStatus(port_name, session, status, error))
     {
         markMKAQueryError(port_name, session, error);
         return false;
     }
 
-    if (allowDesiredReplacement &&
-        !session.pending_old_ckn.empty())
+    if (!session.pending_old_ckn.empty())
     {
-        if (findParticipant(status, session.pending_new_ckn) != nullptr)
+        const auto replacement = findParticipant(status, session.pending_new_ckn);
+        if (replacement != nullptr &&
+            replacement->isPrimary == session.pending_primary &&
+            findParticipant(status, session.pending_old_ckn) == nullptr)
         {
             if (session.pending_primary)
             {
@@ -1443,7 +1412,14 @@ bool MACsecMgr::collectMKAStatus(
         }
     }
 
+    session.participants_verified =
+        session.pending_old_ckn.empty() &&
+        validateExpectedParticipants(session, status, error);
     publishMKAStatus(port_name, session, status);
+    if (!session.participants_verified && session.pending_old_ckn.empty())
+    {
+        setConfigState(port_name, session, error);
+    }
     if (statusResult != nullptr)
     {
         *statusResult = status;
@@ -1490,6 +1466,7 @@ void MACsecMgr::markMKAQueryError(
     MKASession &session,
     const std::string &reason)
 {
+    session.participants_verified = false;
     m_stateMkaSessionTable.set(port_name, {
         {"profile", session.profile_name},
         {"query_status", "error"},
@@ -1507,6 +1484,7 @@ void MACsecMgr::setConfigState(
     const auto desired = m_profiles.find(session.profile_name);
     const bool inSync =
         desired != m_profiles.end() &&
+        session.participants_verified &&
         session.pending_old_ckn.empty() &&
         sameProfile(session.applied_profile, desired->second);
 
@@ -1598,19 +1576,12 @@ void MACsecMgr::reconcileStartupState()
     }
 }
 
-bool MACsecMgr::preflightRollover(
+bool MACsecMgr::selectParticipantToUpdate(
     const std::string &port_name,
     MKASession &session,
     const MACsecProfile &desired,
     bool &primary)
 {
-    MKASessionStatus status;
-    if (!collectMKAStatus(port_name, session, &status, true))
-    {
-        setConfigState(port_name, session, "fresh MKA status is unavailable");
-        return false;
-    }
-
     const bool hasAppliedFallback =
         !session.applied_profile.fallback_ckn.empty() ||
         (!session.pending_old_ckn.empty() && !session.pending_primary);
@@ -1651,35 +1622,7 @@ bool MACsecMgr::preflightRollover(
         return true;
     }
 
-    primary = selectPrimaryReplacement(session, desired, status);
-    return validateRolloverStatus(
-        port_name,
-        session,
-        desired,
-        status,
-        primary);
-}
-
-bool MACsecMgr::validateRolloverStatus(
-    const std::string &port_name,
-    MKASession &session,
-    const MACsecProfile &desired,
-    const MKASessionStatus &status,
-    bool primary)
-{
-    const auto &selectedCkn =
-        !session.pending_old_ckn.empty() ?
-        session.pending_old_ckn :
-        (primary ?
-         session.applied_profile.primary_ckn :
-         session.applied_profile.fallback_ckn);
-    const auto selected = findParticipant(status, selectedCkn);
-    if (selected != nullptr && selected->isPrimary != primary)
-    {
-        setConfigState(port_name, session, "selected participant role is inconsistent");
-        return false;
-    }
-
+    primary = selectPrimaryReplacement(session, desired);
     const auto &replacementCkn =
         usePendingReplacement(session, desired, primary) ?
         session.pending_new_ckn :
@@ -1689,38 +1632,6 @@ bool MACsecMgr::validateRolloverStatus(
     if (replacementCkn == alternateCkn)
     {
         setConfigState(port_name, session, "replacement CKN conflicts with the applied alternate");
-        return false;
-    }
-
-    // Restoring a proven-absent role is not a destructive removal.
-    if (hasNoPeers(status) ||
-        (!session.pending_old_ckn.empty() && selected == nullptr))
-    {
-        return true;
-    }
-
-    if (alternateCkn.empty())
-    {
-        setConfigState(port_name, session, "no alternate participant is configured");
-        return false;
-    }
-
-    if (status.kayStatus != "active" ||
-        status.authenticated ||
-        !status.secured ||
-        status.failed)
-    {
-        setConfigState(port_name, session, "MKA session is not healthy");
-        return false;
-    }
-
-    const auto alternate = findParticipant(status, alternateCkn);
-    if (alternate == nullptr ||
-        alternate->isPrimary == primary ||
-        !alternate->active ||
-        alternate->livePeers == 0)
-    {
-        setConfigState(port_name, session, "alternate participant is not live and role-correct");
         return false;
     }
 
@@ -1747,41 +1658,77 @@ bool MACsecMgr::reconcilePort(
     return false;
 }
 
+bool MACsecMgr::reconcileObservedParticipants(
+    const std::string &port_name,
+    MKASession &session,
+    const MACsecProfile &desired,
+    const MKASessionStatus &status)
+{
+    for (const auto &participant : status.participants)
+    {
+        const auto &expected = participant.isPrimary ?
+            desired.primary_ckn : desired.fallback_ckn;
+        if (participant.ckn != expected)
+        {
+            if (!removeParticipant(port_name, session, participant.ckn))
+            {
+                setConfigState(port_name, session, "failed to remove unexpected participant");
+                return false;
+            }
+        }
+    }
+
+    for (const bool primary : {true, false})
+    {
+        const auto &ckn = primary ? desired.primary_ckn : desired.fallback_ckn;
+        if (ckn.empty())
+        {
+            continue;
+        }
+        const auto observed = findParticipant(status, ckn);
+        if (observed != nullptr && observed->isPrimary == primary)
+        {
+            continue;
+        }
+        if (!updateNetworkParticipant(port_name, session, desired, primary))
+        {
+            setConfigState(port_name, session, "failed to update participant network configuration");
+            return false;
+        }
+        if (!addParticipant(port_name, session, desired, primary))
+        {
+            setConfigState(port_name, session, "failed to add missing participant");
+            return false;
+        }
+    }
+
+    return collectMKAStatus(port_name, session);
+}
+
 bool MACsecMgr::reconcileParticipant(
     const std::string &port_name,
     MKASession &session,
     const MACsecProfile &desired)
 {
     bool primary = false;
-    if (!preflightRollover(port_name, session, desired, primary))
-    {
-        return false;
-    }
-    if (sameProfile(session.applied_profile, desired))
-    {
-        setConfigState(port_name, session, "");
-        return true;
-    }
-
     MKASessionStatus status;
-    if (!collectMKAStatus(port_name, session, &status, true))
+    bool haveStatus = false;
+    if (!session.pending_old_ckn.empty())
     {
-        setConfigState(port_name, session, "fresh MKA status is unavailable");
+        if (!collectMKAStatus(port_name, session, &status))
+        {
+            return false;
+        }
+        haveStatus = true;
+    }
+    if (!selectParticipantToUpdate(port_name, session, desired, primary))
+    {
         return false;
     }
     if (sameProfile(session.applied_profile, desired) && session.pending_old_ckn.empty())
     {
+        setConfigState(port_name, session, "");
         return true;
-    }
-    primary = selectPrimaryReplacement(session, desired, status);
-    if (!validateRolloverStatus(
-            port_name,
-            session,
-            desired,
-            status,
-            primary))
-    {
-        return false;
     }
 
     MACsecProfile replacement = desired;
@@ -1805,7 +1752,9 @@ bool MACsecMgr::reconcileParticipant(
         (primary ?
          session.applied_profile.primary_ckn :
          session.applied_profile.fallback_ckn);
-    if (!oldCkn.empty() && findParticipant(status, oldCkn) != nullptr)
+    const bool pending = !session.pending_old_ckn.empty();
+    if (!oldCkn.empty() &&
+        (!pending || (haveStatus && findParticipant(status, oldCkn) != nullptr)))
     {
         if (!removeParticipant(port_name, session, oldCkn))
         {
@@ -1817,6 +1766,7 @@ bool MACsecMgr::reconcileParticipant(
         session.pending_primary = primary;
         session.pending_new_ckn = primary ? replacement.primary_ckn : replacement.fallback_ckn;
         session.pending_new_cak = primary ? replacement.primary_cak : replacement.fallback_cak;
+        session.participants_verified = false;
         if (primary)
         {
             session.applied_profile.primary_ckn.clear();
@@ -1830,20 +1780,23 @@ bool MACsecMgr::reconcileParticipant(
         setConfigState(port_name, session, "selected participant removed; replacement pending");
 
         MKASessionStatus postRemoveStatus;
-        if (!collectMKAStatus(port_name, session, &postRemoveStatus, true) ||
-            findParticipant(postRemoveStatus, oldCkn) != nullptr)
+        if (collectMKAStatus(port_name, session, &postRemoveStatus))
         {
-            setConfigState(port_name, session, "selected participant removal is not yet verified");
-            return false;
-        }
-        if (session.pending_old_ckn.empty())
-        {
-            return true;
+            if (findParticipant(postRemoveStatus, oldCkn) != nullptr)
+            {
+                setConfigState(port_name, session, "selected participant removal is not yet verified");
+                return false;
+            }
+            if (session.pending_old_ckn.empty())
+            {
+                return true;
+            }
         }
     }
 
     session.pending_new_ckn = primary ? replacement.primary_ckn : replacement.fallback_ckn;
     session.pending_new_cak = primary ? replacement.primary_cak : replacement.fallback_cak;
+    session.participants_verified = false;
     if (!updateNetworkParticipant(port_name, session, replacement, primary))
     {
         setConfigState(port_name, session, "failed to update participant network configuration");
@@ -1855,7 +1808,7 @@ bool MACsecMgr::reconcileParticipant(
         return false;
     }
 
-    if (!collectMKAStatus(port_name, session, nullptr, true))
+    if (!collectMKAStatus(port_name, session))
     {
         return false;
     }
