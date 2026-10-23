@@ -830,7 +830,6 @@ TEST_F(MACsecMgrTest, QueryFailureDoesNotBlockInitialCommandsAndTimerObservesRes
 {
     auto &blocked = session("Ethernet0");
     auto &ready = session("Ethernet4");
-    manager->m_startupStateReconciled = true;
     commandState.failQueryPorts.insert("Ethernet0");
     auto consumer = dynamic_cast<Consumer *>(executor(CFG_MACSEC_PROFILE_TABLE_NAME));
     ASSERT_NE(nullptr, consumer);
@@ -866,22 +865,23 @@ TEST_F(MACsecMgrTest, QueryFailureDoesNotBlockInitialCommandsAndTimerObservesRes
     ASSERT_NE(nullptr, timer);
     timer->execute();
     EXPECT_EQ(forks + 2, wpaProcessCount);
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
     EXPECT_GT(testing_db::writeCount(
-        STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet0"), blockedWrites);
-    EXPECT_EQ(readyWrites + 3, testing_db::writeCount(
-        STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet4"));
+        STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet4"), readyWrites);
 
     commandState.failQueryPorts.clear();
     timer->execute();
     EXPECT_EQ(NEW_PRIMARY_CKN, blocked.applied_profile.primary_ckn);
     EXPECT_EQ(2, commandState.addCalls);
+    EXPECT_TRUE(sessionTable.get("Ethernet0", values));
     EXPECT_TRUE(consumer->m_toSync.empty());
 }
 
 TEST_F(MACsecMgrTest, PeerlessAlternateDoesNotDeferCommandsOrRequireTimer)
 {
     auto &runtime = session();
-    manager->m_startupStateReconciled = true;
     commandState.peerCountsByPort["Ethernet0"].fallbackLive = 0;
     auto consumer = dynamic_cast<Consumer *>(executor(CFG_MACSEC_PROFILE_TABLE_NAME));
     ASSERT_NE(nullptr, consumer);
@@ -917,7 +917,6 @@ TEST_F(MACsecMgrTest, PeerlessAlternateDoesNotDeferCommandsOrRequireTimer)
 TEST_F(MACsecMgrTest, UnsupportedRoleSwapIsObservedOnTimerWithoutRetryChurn)
 {
     auto &runtime = session();
-    manager->m_startupStateReconciled = true;
     auto consumer = dynamic_cast<Consumer *>(executor(CFG_MACSEC_PROFILE_TABLE_NAME));
     ASSERT_NE(nullptr, consumer);
     consumer->addToSync(KeyOpFieldsValuesTuple(
@@ -942,8 +941,8 @@ TEST_F(MACsecMgrTest, UnsupportedRoleSwapIsObservedOnTimerWithoutRetryChurn)
     ASSERT_NE(nullptr, timer);
     timer->execute();
     EXPECT_EQ(forks + 1, wpaProcessCount);
-    EXPECT_EQ(writes + 3, testing_db::writeCount(
-        STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet0"));
+    EXPECT_GT(testing_db::writeCount(
+        STATE_DB, STATE_MACSEC_MKA_SESSION_TABLE_NAME, "Ethernet0"), writes);
     EXPECT_EQ(0, commandState.addCalls);
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
     string value;
@@ -956,7 +955,6 @@ TEST_F(MACsecMgrTest, UnsupportedRoleSwapIsObservedOnTimerWithoutRetryChurn)
 TEST_F(MACsecMgrTest, FailedFallbackAddRecoversOnTimerWithoutConfigReplay)
 {
     auto &runtime = session();
-    manager->m_startupStateReconciled = true;
     commandState.failFallbackAdd = true;
     auto consumer = dynamic_cast<Consumer *>(executor(CFG_MACSEC_PROFILE_TABLE_NAME));
     ASSERT_NE(nullptr, consumer);
@@ -1015,27 +1013,80 @@ TEST_F(MACsecMgrTest, RejectedNetworkUpdateRetriesInPlaceWithoutRemovingAgain)
     EXPECT_EQ("in-sync", status);
 }
 
-TEST_F(MACsecMgrTest, QueryFailurePreservesLastSuccessfulSnapshot)
+TEST_F(MACsecMgrTest, QueryFailureDeletesOnlyFailedPortAndRecoveryRepublishes)
 {
     auto &mkaSession = session();
+    auto &otherSession = session("Ethernet4");
     ASSERT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
+    ASSERT_TRUE(manager->collectMKAStatus("Ethernet4", otherSession));
 
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
     Table participantTable(stateDb.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
-    string lastUpdated;
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "last_updated", lastUpdated));
-
-    commandState.failQuery = true;
+    commandState.failQueryPort = "Ethernet0";
     EXPECT_FALSE(manager->collectMKAStatus("Ethernet0", mkaSession));
 
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
+    EXPECT_FALSE(participantTable.get("Ethernet0|" + PRIMARY_CKN, values));
+    EXPECT_FALSE(participantTable.get("Ethernet0|" + FALLBACK_CKN, values));
+    EXPECT_TRUE(sessionTable.get("Ethernet4", values));
+    EXPECT_TRUE(participantTable.get("Ethernet4|" + PRIMARY_CKN, values));
+    EXPECT_FALSE(mkaSession.participants_verified);
+    EXPECT_EQ(PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
+
+    commandState.failQueryPort.clear();
+    EXPECT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
     string value;
     ASSERT_TRUE(getField(sessionTable, "Ethernet0", "query_status", value));
-    EXPECT_EQ("error", value);
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "last_updated", value));
-    EXPECT_EQ(lastUpdated, value);
-    vector<FieldValueTuple> participantValues;
-    EXPECT_TRUE(participantTable.get("Ethernet0|" + PRIMARY_CKN, participantValues));
-    EXPECT_FALSE(fvsGetValue(participantValues, "participant", true));
+    EXPECT_EQ("ok", value);
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", value));
+    EXPECT_EQ("in-sync", value);
+    EXPECT_TRUE(participantTable.get("Ethernet0|" + PRIMARY_CKN, values));
+    EXPECT_TRUE(participantTable.get("Ethernet0|" + FALLBACK_CKN, values));
+}
+
+TEST_F(MACsecMgrTest, IncompleteStatusDeletesRowsWithoutLosingPendingReplacement)
+{
+    auto &mkaSession = session();
+    auto &otherSession = session("Ethernet4");
+    otherSession.profile_name = "other";
+    manager->m_profiles["other"] = profile();
+    ASSERT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
+    ASSERT_TRUE(manager->collectMKAStatus("Ethernet4", otherSession));
+
+    commandState.failFallbackAdd = true;
+    EXPECT_EQ(task_success, manager->loadProfile(
+        "profile", profileArgs(PRIMARY_CKN, NEW_FALLBACK_CKN)));
+    ASSERT_EQ(FALLBACK_CKN, mkaSession.pending_old_ckn);
+    ASSERT_EQ(NEW_FALLBACK_CKN, mkaSession.pending_new_ckn);
+    ASSERT_EQ(1, commandState.addCalls);
+
+    commandState.failOperation = "macsec_mka_list";
+    commandState.failureOutput = statusOutput(PRIMARY_CKN) +
+        "participant_idx=2\nckn=" + NEW_PRIMARY_CKN + "\n";
+    commandState.failureStatus = 0;
+    EXPECT_FALSE(manager->collectMKAStatus("Ethernet0", mkaSession));
+
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    Table participantTable(stateDb.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
+    EXPECT_FALSE(participantTable.get("Ethernet0|" + PRIMARY_CKN, values));
+    EXPECT_FALSE(participantTable.get("Ethernet0|" + FALLBACK_CKN, values));
+    EXPECT_TRUE(sessionTable.get("Ethernet4", values));
+    EXPECT_TRUE(participantTable.get("Ethernet4|" + PRIMARY_CKN, values));
+    EXPECT_EQ(FALLBACK_CKN, mkaSession.pending_old_ckn);
+    EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.pending_new_ckn);
+    EXPECT_EQ(1, commandState.addCalls);
+
+    commandState.failOperation.clear();
+    commandState.failFallbackAdd = false;
+    manager->sweepMKAStatus();
+    EXPECT_EQ(NEW_FALLBACK_CKN, mkaSession.applied_profile.fallback_ckn);
+    EXPECT_EQ(2, commandState.addCalls);
+    EXPECT_TRUE(sessionTable.get("Ethernet0", values));
+    EXPECT_TRUE(participantTable.get("Ethernet0|" + NEW_FALLBACK_CKN, values));
+    EXPECT_TRUE(sessionTable.get("Ethernet4", values));
 }
 
 TEST_F(MACsecMgrTest, UnexpectedParticipantIsPublishedButNotReportedInSync)
@@ -1212,10 +1263,12 @@ TEST_F(MACsecMgrTest, TimerSweepQueriesAllPortsAndIsolatesFailure)
     EXPECT_EQ(ports, queriedPorts);
 
     string value;
-    ASSERT_TRUE(getField(sessionTable, "Ethernet104", "query_status", value));
-    EXPECT_EQ("error", value);
-    ASSERT_TRUE(getField(sessionTable, "Ethernet104", "last_updated", value));
-    EXPECT_EQ("2000-01-01T00:00:00Z", value);
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet104", values));
+    Table participantTable(stateDb.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
+    EXPECT_FALSE(participantTable.get("Ethernet104|" + PRIMARY_CKN, values));
+    EXPECT_TRUE(sessionTable.get("Ethernet100", values));
+    EXPECT_TRUE(participantTable.get("Ethernet100|" + PRIMARY_CKN, values));
 
     ASSERT_TRUE(getField(sessionTable, "Ethernet136", "query_status", value));
     EXPECT_EQ("ok", value);
@@ -1223,7 +1276,7 @@ TEST_F(MACsecMgrTest, TimerSweepQueriesAllPortsAndIsolatesFailure)
     EXPECT_NE("2000-01-01T00:00:00Z", value);
 }
 
-TEST(MACsecMgrRestart, RetainsConfiguredRowsAndDeletesOrphans)
+TEST(MACsecMgrRestart, ConstructorPurgesStaleRowsBeforeFirstPublication)
 {
     testing_db::reset();
     auto configDb = make_shared<DBConnector>("CONFIG_DB", 0);
@@ -1232,28 +1285,54 @@ TEST(MACsecMgrRestart, RetainsConfiguredRowsAndDeletesOrphans)
     Table configPortTable(configDb.get(), CFG_PORT_TABLE_NAME);
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
     Table participantTable(stateDb.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
+    Table unrelatedTable(stateDb.get(), STATE_PORT_TABLE_NAME);
 
     configPortTable.set("Ethernet0", {{"macsec", "profile"}});
     sessionTable.set("Ethernet0", {{"query_status", "ok"}});
     sessionTable.set("Ethernet4", {{"query_status", "ok"}});
     participantTable.set("Ethernet0|" + PRIMARY_CKN, {{"active", "true"}});
     participantTable.set("Ethernet4|" + PRIMARY_CKN, {{"active", "true"}});
+    participantTable.set("Ethernet8|" + PRIMARY_CKN, {{"active", "true"}});
+    unrelatedTable.set("Ethernet0", {{"state", "ok"}});
 
     MACsecMgr manager(
         configDb.get(),
         appDb.get(),
         stateDb.get(),
         {CFG_MACSEC_PROFILE_TABLE_NAME, CFG_PORT_TABLE_NAME});
-    manager.reconcileStartupState();
 
     vector<FieldValueTuple> values;
-    string queryStatus;
-    EXPECT_TRUE(sessionTable.get("Ethernet0", values));
-    EXPECT_TRUE(getField(sessionTable, "Ethernet0", "query_status", queryStatus));
-    EXPECT_EQ("error", queryStatus);
-    EXPECT_TRUE(participantTable.get("Ethernet0|" + PRIMARY_CKN, values));
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
+    EXPECT_FALSE(participantTable.get("Ethernet0|" + PRIMARY_CKN, values));
     EXPECT_FALSE(sessionTable.get("Ethernet4", values));
     EXPECT_FALSE(participantTable.get("Ethernet4|" + PRIMARY_CKN, values));
+    EXPECT_FALSE(participantTable.get("Ethernet8|" + PRIMARY_CKN, values));
+    EXPECT_TRUE(unrelatedTable.get("Ethernet0", values));
+}
+
+TEST(MACsecMgrRestart, GracefulShutdownPurgesDaemonOwnedRows)
+{
+    testing_db::reset();
+    auto configDb = make_shared<DBConnector>("CONFIG_DB", 0);
+    auto appDb = make_shared<DBConnector>("APPL_DB", 0);
+    auto stateDb = make_shared<DBConnector>("STATE_DB", 0);
+    Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
+    Table participantTable(stateDb.get(), STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME);
+    Table unrelatedTable(stateDb.get(), STATE_PORT_TABLE_NAME);
+    {
+        MACsecMgr manager(
+            configDb.get(), appDb.get(), stateDb.get(),
+            {CFG_MACSEC_PROFILE_TABLE_NAME, CFG_PORT_TABLE_NAME});
+        sessionTable.set("Ethernet0", {{"query_status", "ok"}});
+        participantTable.set("Ethernet0|" + PRIMARY_CKN, {{"active", "true"}});
+        participantTable.set("Ethernet4|" + PRIMARY_CKN, {{"active", "true"}});
+        unrelatedTable.set("Ethernet0", {{"state", "ok"}});
+    }
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
+    EXPECT_FALSE(participantTable.get("Ethernet0|" + PRIMARY_CKN, values));
+    EXPECT_FALSE(participantTable.get("Ethernet4|" + PRIMARY_CKN, values));
+    EXPECT_TRUE(unrelatedTable.get("Ethernet0", values));
 }
 
 TEST_F(MACsecMgrTest, PrimaryRolloverRemovesBeforeAddingWithoutRestart)
@@ -1331,9 +1410,9 @@ TEST_F(MACsecMgrTest, QueryFailureOnOnePortDoesNotBlockOtherPorts)
         }));
 
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
-    string configStatus;
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", configStatus));
-    EXPECT_EQ("degraded", configStatus);
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
+    EXPECT_TRUE(sessionTable.get("Ethernet4", values));
 }
 
 TEST_F(MACsecMgrTest, MultipleSafePortsAllRotate)
@@ -1403,6 +1482,7 @@ TEST_F(MACsecMgrTest, DesiredProfileIsCachedWithoutRuntimeSession)
 TEST_F(MACsecMgrTest, FallbackPresenceChangesRemainUnsupported)
 {
     auto &mkaSession = session();
+    ASSERT_TRUE(manager->collectMKAStatus("Ethernet0", mkaSession));
     auto desired = primaryOnlyProfile();
     manager->m_profiles["profile"] = desired;
 
@@ -1529,15 +1609,15 @@ TEST_F(MACsecMgrTest, QueryFailureDoesNotVetoInitialCommandsOrClaimConvergence)
             return cmd.find("macsec_add_mka") != string::npos;
         }));
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
-    string status;
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "query_status", status));
-    EXPECT_EQ("error", status);
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
-    EXPECT_EQ("degraded", status);
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
     commandState.failQueryPorts.clear();
     EXPECT_EQ(task_success, manager->loadProfile("profile", primaryOnlyProfileArgs(NEW_PRIMARY_CKN)));
     EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
     EXPECT_EQ(1, commandState.addCalls);
+    string status;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "query_status", status));
+    EXPECT_EQ("ok", status);
 }
 
 TEST_F(MACsecMgrTest, PeerAppearingDuringObservationDoesNotVetoCommands)
@@ -1679,11 +1759,9 @@ TEST_F(MACsecMgrTest, AmbiguousRemoveWaitsForStatusThenAddsWithoutRemovingAgain)
     EXPECT_EQ(FALLBACK_CKN, mkaSession.pending_old_ckn);
     EXPECT_EQ(0, commandState.addCalls);
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
-    string status;
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "query_status", status));
-    EXPECT_EQ("error", status);
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
-    EXPECT_EQ("degraded", status);
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
+    EXPECT_EQ(FALLBACK_CKN, mkaSession.pending_old_ckn);
 
     manager->sweepMKAStatus();
     EXPECT_EQ(0, commandState.addCalls);
@@ -1694,6 +1772,7 @@ TEST_F(MACsecMgrTest, AmbiguousRemoveWaitsForStatusThenAddsWithoutRemovingAgain)
     EXPECT_EQ(1, count_if(mockCallArgs.begin(), mockCallArgs.end(), [](const string &cmd) {
         return cmd.find("macsec_del_mka") != string::npos;
     }));
+    string status;
     ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", status));
     EXPECT_EQ("in-sync", status);
 }
@@ -1753,11 +1832,8 @@ TEST_F(MACsecMgrTest, PostAddQueryFailureKeepsPendingUntilReplacementObserved)
     EXPECT_EQ(1, commandState.addCalls);
 
     Table sessionTable(stateDb.get(), STATE_MACSEC_MKA_SESSION_TABLE_NAME);
-    string value;
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "query_status", value));
-    EXPECT_EQ("error", value);
-    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", value));
-    EXPECT_EQ("degraded", value);
+    vector<FieldValueTuple> values;
+    EXPECT_FALSE(sessionTable.get("Ethernet0", values));
 
     EXPECT_EQ(
         task_success,
@@ -1766,6 +1842,9 @@ TEST_F(MACsecMgrTest, PostAddQueryFailureKeepsPendingUntilReplacementObserved)
     EXPECT_EQ(NEW_PRIMARY_CKN, mkaSession.applied_profile.primary_ckn);
     EXPECT_TRUE(mkaSession.pending_old_ckn.empty());
     EXPECT_EQ(1, commandState.addCalls);
+    string value;
+    ASSERT_TRUE(getField(sessionTable, "Ethernet0", "config_status", value));
+    EXPECT_EQ("in-sync", value);
 }
 
 TEST_F(MACsecMgrTest, MissingReplacementAfterAddRemainsPendingUntilRetryObservation)

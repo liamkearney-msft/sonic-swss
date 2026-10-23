@@ -80,6 +80,7 @@ public:
         std::string pending_new_ckn;
         std::string pending_new_cak;
         bool participants_verified = false;
+        bool status_published = false;
         std::string config_error;
     };
 
@@ -94,11 +95,9 @@ private:
 
 
     Table m_statePortTable;
-    Table m_cfgPortTable;
     Table m_stateMkaSessionTable;
     Table m_stateMkaParticipantTable;
     SelectableTimer *m_mkaStatusTimer = nullptr;
-    bool m_startupStateReconciled = false;
 
     // APPL_DB MACsec tables, written by wpa_supplicant's macsec_sonic driver
     // and consumed by orchagent. macsecmgrd only touches them to remove what
@@ -138,7 +137,7 @@ private:
         const std::string &port_name,
         MKASession &session,
         const MKASessionStatus &status);
-    void markMKAQueryError(
+    void handleMKAQueryFailure(
         const std::string &port_name,
         MKASession &session,
         const std::string &reason);
@@ -147,7 +146,7 @@ private:
         MKASession &session,
         const std::string &error);
     void deleteOperationalState(const std::string &port_name);
-    void reconcileStartupState();
+    void clearMKAState();
     void doTask(SelectableTimer &timer) override;
     void sweepMKAStatus();
     bool selectParticipantToUpdate(

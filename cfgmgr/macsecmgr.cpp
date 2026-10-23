@@ -429,7 +429,6 @@ MACsecMgr::MACsecMgr(
     const vector<std::string> &tables) :
         Orch(cfgDb, tables),
         m_statePortTable(stateDb, STATE_PORT_TABLE_NAME),
-        m_cfgPortTable(cfgDb, CFG_PORT_TABLE_NAME),
         m_stateMkaSessionTable(stateDb, STATE_MACSEC_MKA_SESSION_TABLE_NAME),
         m_stateMkaParticipantTable(stateDb, STATE_MACSEC_MKA_PARTICIPANT_TABLE_NAME),
         m_clearStaleTimeoutMs(CLEAR_STALE_TIMEOUT_MS)
@@ -440,6 +439,8 @@ MACsecMgr::MACsecMgr(
         SWSS_LOG_THROW("MACsec profile consumer is missing or has the wrong type");
     }
     profileConsumer->setRecordable(false);
+
+    clearMKAState();
 
     const auto interval = timespec {
         .tv_sec = MKA_STATUS_SWEEP_INTERVAL_SECONDS,
@@ -452,13 +453,6 @@ MACsecMgr::MACsecMgr(
         "MACSEC_MKA_STATUS_TIMER");
     Orch::addExecutor(executor);
     m_mkaStatusTimer->start();
-
-    std::vector<std::string> keys;
-    m_stateMkaSessionTable.getKeys(keys);
-    for (const auto &key : keys)
-    {
-        m_stateMkaSessionTable.hset(key, "query_status", "error");
-    }
 
     // SA and SC entries first, the PORT entry last: the PORT DEL is the one
     // orchagent acts on (it cascades to every SC and SA under the port), so it
@@ -481,10 +475,10 @@ MACsecMgr::MACsecMgr(
 
 MACsecMgr::~MACsecMgr()
 {
+    clearMKAState();
     while (!m_macsec_ports.empty())
     {
         auto port = m_macsec_ports.begin();
-        markMKAQueryError(port->first, port->second, "manager stopped");
         unconfigureMACsec(port->first, port->second);
         stopWPASupplicant(port->second.wpa_supplicant_pid);
         m_macsec_ports.erase(port);
@@ -494,13 +488,6 @@ MACsecMgr::~MACsecMgr()
 void MACsecMgr::doTask()
 {
     Orch::doTask();
-
-    if (!m_startupStateReconciled)
-    {
-        reconcileStartupState();
-        m_startupStateReconciled = true;
-    }
-
 }
 
 void MACsecMgr::doTask(SelectableTimer &timer)
@@ -1384,7 +1371,7 @@ bool MACsecMgr::collectMKAStatus(
 
     if (!queryMKAStatus(port_name, session, status, error))
     {
-        markMKAQueryError(port_name, session, error);
+        handleMKAQueryFailure(port_name, session, error);
         return false;
     }
 
@@ -1432,12 +1419,8 @@ void MACsecMgr::publishMKAStatus(
     MKASession &session,
     const MKASessionStatus &status)
 {
-    auto sessionValues = status.toFieldValues();
-    sessionValues.emplace_back("profile", session.profile_name);
-    sessionValues.emplace_back("query_status", "ok");
-    sessionValues.emplace_back("last_updated", utcTimestamp());
-    m_stateMkaSessionTable.set(port_name, sessionValues);
-
+    m_stateMkaSessionTable.del(port_name);
+    session.status_published = false;
     std::set<std::string> publishedKeys;
     for (const auto &participant : status.participants)
     {
@@ -1458,20 +1441,23 @@ void MACsecMgr::publishMKAStatus(
         }
     }
 
+    auto sessionValues = status.toFieldValues();
+    sessionValues.emplace_back("profile", session.profile_name);
+    sessionValues.emplace_back("query_status", "ok");
+    sessionValues.emplace_back("last_updated", utcTimestamp());
+    m_stateMkaSessionTable.set(port_name, sessionValues);
+    session.status_published = true;
     setConfigState(port_name, session, "");
 }
 
-void MACsecMgr::markMKAQueryError(
+void MACsecMgr::handleMKAQueryFailure(
     const std::string &port_name,
     MKASession &session,
     const std::string &reason)
 {
     session.participants_verified = false;
-    m_stateMkaSessionTable.set(port_name, {
-        {"profile", session.profile_name},
-        {"query_status", "error"},
-    });
-    setConfigState(port_name, session, "");
+    session.status_published = false;
+    deleteOperationalState(port_name);
     SWSS_LOG_WARN("MKA status query for port '%s' failed: %s",
                   port_name.c_str(), reason.c_str());
 }
@@ -1491,8 +1477,11 @@ void MACsecMgr::setConfigState(
     if (inSync)
     {
         session.config_error.clear();
-        m_stateMkaSessionTable.hset(port_name, "config_status", "in-sync");
-        m_stateMkaSessionTable.hdel(port_name, "config_error");
+        if (session.status_published)
+        {
+            m_stateMkaSessionTable.hset(port_name, "config_status", "in-sync");
+            m_stateMkaSessionTable.hdel(port_name, "config_error");
+        }
         return;
     }
 
@@ -1505,10 +1494,13 @@ void MACsecMgr::setConfigState(
         session.config_error = "desired profile is not applied";
     }
 
-    m_stateMkaSessionTable.set(port_name, {
-        {"config_status", "degraded"},
-        {"config_error", session.config_error},
-    });
+    if (session.status_published)
+    {
+        m_stateMkaSessionTable.set(port_name, {
+            {"config_status", "degraded"},
+            {"config_error", session.config_error},
+        });
+    }
 }
 
 void MACsecMgr::deleteOperationalState(const std::string &port_name)
@@ -1526,53 +1518,22 @@ void MACsecMgr::deleteOperationalState(const std::string &port_name)
     }
 }
 
-void MACsecMgr::reconcileStartupState()
+void MACsecMgr::clearMKAState()
 {
-    std::set<std::string> configuredPorts;
-    std::vector<std::string> portKeys;
-    m_cfgPortTable.getKeys(portKeys);
-    for (const auto &port : portKeys)
-    {
-        std::vector<FieldValueTuple> values;
-        std::string profile;
-        if (m_cfgPortTable.get(port, values) &&
-            get_value(values, "macsec", profile) &&
-            !profile.empty())
-        {
-            configuredPorts.insert(port);
-        }
-    }
-
+    // The two MKA tables are owned solely by macsecmgrd in this STATE_DB
+    // namespace; never clear other state tables or another DB connector.
     std::vector<std::string> sessionKeys;
     m_stateMkaSessionTable.getKeys(sessionKeys);
     for (const auto &port : sessionKeys)
     {
-        if (configuredPorts.find(port) == configuredPorts.end())
-        {
-            deleteOperationalState(port);
-        }
-        else
-        {
-            m_stateMkaSessionTable.hset(port, "query_status", "error");
-        }
+        m_stateMkaSessionTable.del(port);
     }
 
     std::vector<std::string> participantKeys;
     m_stateMkaParticipantTable.getKeys(participantKeys);
     for (const auto &key : participantKeys)
     {
-        const auto separator = key.find('|');
-        const auto port = key.substr(0, separator);
-        if (separator == std::string::npos ||
-            configuredPorts.find(port) == configuredPorts.end())
-        {
-            m_stateMkaParticipantTable.del(key);
-        }
-    }
-
-    for (auto &port : m_macsec_ports)
-    {
-        collectMKAStatus(port.first, port.second);
+        m_stateMkaParticipantTable.del(key);
     }
 }
 
